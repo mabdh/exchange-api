@@ -1,13 +1,13 @@
 package com.horizon.exchangeapi
 
 import akka.event.LoggingAdapter
+import akka.http.scaladsl.model.headers.Language
 import com.horizon.exchangeapi
 import com.horizon.exchangeapi.auth._
 
 import scala.util._
 import scala.collection.mutable.{HashMap => MutableHashMap}
 import javax.security.auth.Subject
-
 import scala.jdk.CollectionConverters.CollectionHasAsScala
 import scala.util.matching.Regex
 
@@ -216,7 +216,7 @@ trait AuthorizationSupport {
   case class AuthenticatedIdentity(identity: Identity, subject: Subject) {
 
     // Determines if this authenticated identity has the specified access to the specified target
-    def authorizeTo(target: Target, access: Access): Try[Identity] = {
+    def authorizeTo(target: Target, access: Access)(implicit acceptLang: Language): Try[Identity] = {
       try {
         identity match {
           case IUser(_) =>
@@ -252,12 +252,12 @@ abstract class Identity {
   def isHubAdmin = false       // IUser overrides this
   def isAnonymous = false // = creds.isAnonymous
   def identityString: String = creds.id     // for error msgs
-  def accessDeniedMsg(access: Access, target: Target): String = ExchMsg.translate("access.denied.no.auth", identityString, access, target.toAccessMsg)
+  def accessDeniedMsg(access: Access, target: Target)(implicit acceptLang: Language): String = ExchMsg.translate("access.denied.no.auth", identityString, access, target.toAccessMsg)
   //var hasFrontEndAuthority = false   // true if this identity was already vetted by the front end
   def isMultiTenantAgbot: Boolean = false
 
 /** Returns true if the token is correct for this user and not expired */
-def isTokenValid(token: String, username: String): Boolean = {
+def isTokenValid(token: String, username: String)(implicit acceptLang: Language): Boolean = {
   // Get their current hashed pw to use as the secret
   AuthCache.getUser(username) match {
     case Some(userHashedTok) => Token.isValid(token, userHashedTok)
@@ -267,7 +267,7 @@ def isTokenValid(token: String, username: String): Boolean = {
 
   // Called by auth/Module.login() to authenticate a local user/node/agbot
   // Note: this is defined here, instead of AuthenticationSupport, because this class is already set up to use AuthCache
-  def authenticate(hint: String = ""): Identity = {
+  def authenticate(hint: String = "")(implicit acceptLang: Language): Identity = {
     //if (hasFrontEndAuthority) return this       // it is already a specific subclass
     //if (creds.isAnonymous) return toIAnonymous
     if (hint == "token") {
@@ -326,7 +326,7 @@ case class IUser(creds: Creds) extends Identity {
     else if (isHubAdmin) AuthRoles.HubAdmin
     else AuthRoles.User
 
-  override def authorizeTo(target: Target, access: Access)(implicit logger: LoggingAdapter): Try[Identity] = {
+  override def authorizeTo(target: Target, access: Access)(implicit logger: LoggingAdapter, acceptLang: Language): Try[Identity] = {
     val requiredAccess: Access =
       // Transform any generic access into specific access
       if (isMyOrg(target) || target.isPublic) {
@@ -447,7 +447,7 @@ case class IUser(creds: Creds) extends Identity {
 case class INode(creds: Creds) extends Identity {
   override lazy val role: String = AuthRoles.Node
 
-  def authorizeTo(target: Target, access: Access)(implicit logger: LoggingAdapter): Try[Identity] = {
+  def authorizeTo(target: Target, access: Access)(implicit logger: LoggingAdapter, acceptLang: Language): Try[Identity] = {
     // Transform any generic access into specific access
     val requiredAccess: Access =
       if (isMyOrg(target) || target.isPublic || isMsgToMultiTenantAgbot(target,access)) {
@@ -520,7 +520,7 @@ case class INode(creds: Creds) extends Identity {
 case class IAgbot(creds: Creds) extends Identity {
   override lazy val role: String = AuthRoles.Agbot
 
-  def authorizeTo(target: Target, access: Access)(implicit logger: LoggingAdapter): Try[Identity] = {
+  def authorizeTo(target: Target, access: Access)(implicit logger: LoggingAdapter, acceptLang: Language): Try[Identity] = {
     // Transform any generic access into specific access
     val requiredAccess: Access =
       if (isMyOrg(target) || target.isPublic || isMultiTenantAgbot) {
@@ -591,7 +591,7 @@ case class IAgbot(creds: Creds) extends Identity {
 case class IAnonymous(creds: Creds) extends Identity {
   override lazy val role: String = AuthRoles.Anonymous
 
-  def authorizeTo(target: Target, access: Access)(implicit logger: LoggingAdapter): Try[Identity] = {
+  def authorizeTo(target: Target, access: Access)(implicit logger: LoggingAdapter, acceptLang: Language): Try[Identity] = {
     // Transform any generic access into specific access
     val requiredAccess: Access =
       // Note: IAnonymous.isMyOrg() is always false (except for admin operations), so if we had another route that should work for anonymous, so something like:
@@ -698,7 +698,7 @@ case class TOrg(id: String) extends Target {
   override def label = "org"
 }
 
-case class TUser(id: String) extends Target {
+case class TUser(id: String)(implicit acceptLang: Language) extends Target {
   override def isOwner(user: IUser): Boolean = id == user.creds.id
   override def isThere: Boolean = all || mine || AuthCache.getUserIsAdmin(id).nonEmpty
   //override def isAdmin: Boolean = AuthCache.getUserIsAdmin(id).getOrElse(false) // <- these 2 are reliable on every exchange instance
@@ -707,7 +707,7 @@ case class TUser(id: String) extends Target {
   override def label = "user"
 }
 
-case class TNode(id: String) extends Target {
+case class TNode(id: String)(implicit acceptLang: Language) extends Target {
   override def isOwner(user: IUser): Boolean = {
     AuthCache.getNodeOwner(id) match {
       case Some(owner) => if (owner == user.creds.id) true else false
@@ -718,7 +718,7 @@ case class TNode(id: String) extends Target {
   override def label = "node"
 }
 
-case class TAgbot(id: String) extends Target {
+case class TAgbot(id: String)(implicit acceptLang: Language) extends Target {
   override def isOwner(user: IUser): Boolean = {
     AuthCache.getAgbotOwner(id) match {
       case Some(owner) => if (owner == user.creds.id) true else false
@@ -729,7 +729,7 @@ case class TAgbot(id: String) extends Target {
   override def label = "agbot"
 }
 
-case class TService(id: String) extends Target {      // for services only the user that created it can update/delete it
+case class TService(id: String)(implicit acceptLang: Language) extends Target {      // for services only the user that created it can update/delete it
   override def isOwner(user: IUser): Boolean = {
     AuthCache.getServiceOwner(id) match {
       case Some(owner) => if (owner == user.creds.id) true else false
@@ -741,7 +741,7 @@ case class TService(id: String) extends Target {      // for services only the u
   override def label = "service"
 }
 
-case class TPattern(id: String) extends Target {      // for patterns only the user that created it can update/delete it
+case class TPattern(id: String)(implicit acceptLang: Language) extends Target {      // for patterns only the user that created it can update/delete it
   override def isOwner(user: IUser): Boolean = {
     AuthCache.getPatternOwner(id) match {
       case Some(owner) => if (owner == user.creds.id) true else false
@@ -753,7 +753,7 @@ case class TPattern(id: String) extends Target {      // for patterns only the u
   override def label = "pattern"
 }
 
-case class TBusiness(id: String) extends Target {      // for business policies only the user that created it can update/delete it
+case class TBusiness(id: String)(implicit acceptLang: Language) extends Target {      // for business policies only the user that created it can update/delete it
   override def isOwner(user: IUser): Boolean = {
     AuthCache.getBusinessOwner(id) match {
       case Some(owner) => if (owner == user.creds.id) true else false

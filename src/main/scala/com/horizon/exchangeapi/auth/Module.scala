@@ -1,11 +1,12 @@
 package com.horizon.exchangeapi.auth
 
+import akka.http.scaladsl.model.headers.Language
 import com.horizon.exchangeapi._
+
 import javax.security.auth._
 import javax.security.auth.callback._
 import javax.security.auth.login.FailedLoginException
 import javax.security.auth.spi.LoginModule
-
 import scala.util._
 
 /**
@@ -38,6 +39,7 @@ class Module extends LoginModule with AuthorizationSupport {
    */
   override def login(): Boolean = {
     //logger.debug("in Module.login() to try to authenticate a local exchange user")
+    implicit val acceptLang: Language = implicitly[Language]
     val reqCallback = new RequestCallback
     val loginResult = Try {
       handler.handle(Array(reqCallback))

@@ -30,6 +30,7 @@ import org.json4s._
 import org.json4s.jackson.Serialization.write
 
 import scala.collection.mutable.{HashMap => MutableHashMap}
+import akka.http.scaladsl.model.headers.Language
 
 /** HTTP codes, taken from https://en.wikipedia.org/wiki/List_of_HTTP_status_codes and https://www.restapitutorial.com/httpstatuscodes.html */
 object HttpCode {
@@ -67,20 +68,20 @@ object HttpCode {
 /** These are used as the response structure for most PUTs, POSTs, and DELETEs. */
 final case class ApiResponse(code: String, msg: String)
 object ApiRespType {
-  val BADCREDS: String = ExchMsg.translate("api.bad.creds")
-  val ACCESS_DENIED: String = ExchMsg.translate("api.access.denied")
-  val ALREADY_EXISTS: String = ExchMsg.translate("api.already.exists")
-  val BAD_INPUT: String = ExchMsg.translate("api.invalid.input")
-  val NOT_FOUND: String = ExchMsg.translate("api.not.found")
-  val INTERNAL_ERROR: String = ExchMsg.translate("api.internal.error")
-  val NOT_IMPLEMENTED: String = ExchMsg.translate("api.not.implemented")
-  val BAD_GW: String = ExchMsg.translate("api.db.connection.error")
-  val GW_TIMEOUT: String = ExchMsg.translate("api.db.timeout")
-  val ERROR: String = ExchMsg.translate("error")
-  val WARNING: String = ExchMsg.translate("warning")
-  val INFO: String = ExchMsg.translate("info")
-  val OK: String = ExchMsg.translate("ok")
-  val TOO_BUSY: String = ExchMsg.translate("too.busy")
+  def BADCREDS(implicit acceptLang: Language): String = ExchMsg.translate("api.bad.creds")
+  def ACCESS_DENIED(implicit acceptLang: Language): String = ExchMsg.translate("api.access.denied")
+  def ALREADY_EXISTS(implicit acceptLang: Language): String = ExchMsg.translate("api.already.exists")
+  def BAD_INPUT(implicit acceptLang: Language): String = ExchMsg.translate("api.invalid.input")
+  def NOT_FOUND(implicit acceptLang: Language): String = ExchMsg.translate("api.not.found")
+  def INTERNAL_ERROR(implicit acceptLang: Language): String = ExchMsg.translate("api.internal.error")
+  def NOT_IMPLEMENTED(implicit acceptLang: Language): String = ExchMsg.translate("api.not.implemented")
+  def BAD_GW(implicit acceptLang: Language): String = ExchMsg.translate("api.db.connection.error")
+  def GW_TIMEOUT(implicit acceptLang: Language): String = ExchMsg.translate("api.db.timeout")
+  def ERROR(implicit acceptLang: Language): String = ExchMsg.translate("error")
+  def WARNING(implicit acceptLang: Language): String = ExchMsg.translate("warning")
+  def INFO(implicit acceptLang: Language): String = ExchMsg.translate("info")
+  def OK(implicit acceptLang: Language): String = ExchMsg.translate("ok")
+  def TOO_BUSY(implicit acceptLang: Language): String = ExchMsg.translate("too.busy")
 }
 
 trait ExchangeRejection extends Rejection {
@@ -111,49 +112,49 @@ final case class AuthRejection(t: Throwable) extends ExchangeRejection {
   }
 }
 
-final case class NotFoundRejection(apiRespMsg: String) extends ExchangeRejection {
+final case class NotFoundRejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ClientError = StatusCodes.NotFound
   def apiRespCode: String = ApiRespType.NOT_FOUND
 }
 
 //someday: the rest of these rejections are not currently used. Instead the route implementations either do the complete() directly,
 //  or turn an AuthException into a complete() using its toComplete method. But maybe it is better for the akka framework to know it is a rejection.
-final case class BadCredsRejection(apiRespMsg: String) extends ExchangeRejection {
+final case class BadCredsRejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ClientError = StatusCodes.Unauthorized
   def apiRespCode: String = ApiRespType.BADCREDS
 }
 
-final case class BadInputRejection(apiRespMsg: String) extends ExchangeRejection {
+final case class BadInputRejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ClientError = StatusCodes.BadRequest
   def apiRespCode: String = ApiRespType.BAD_INPUT
 }
 
-final case class AccessDeniedRejection(apiRespMsg: String) extends ExchangeRejection {
+final case class AccessDeniedRejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ClientError = StatusCodes.Forbidden
   def apiRespCode: String = ApiRespType.ACCESS_DENIED
 }
 
-final case class AlreadyExistsRejection(apiRespMsg: String) extends ExchangeRejection {
+final case class AlreadyExistsRejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ClientError = StatusCodes.Forbidden
   def apiRespCode: String = ApiRespType.ALREADY_EXISTS
 }
 
-final case class AlreadyExists2Rejection(apiRespMsg: String) extends ExchangeRejection {
+final case class AlreadyExists2Rejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ClientError = StatusCodes.Conflict
   def apiRespCode: String = ApiRespType.ALREADY_EXISTS
 }
 
-final case class BadGwRejection(apiRespMsg: String) extends ExchangeRejection {
+final case class BadGwRejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ServerError = StatusCodes.BadGateway
   def apiRespCode: String = ApiRespType.BAD_GW
 }
 
-final case class GwTimeoutRejection(apiRespMsg: String) extends ExchangeRejection {
+final case class GwTimeoutRejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ServerError = StatusCodes.GatewayTimeout
   def apiRespCode: String = ApiRespType.GW_TIMEOUT
 }
 
-final case class InternalErrorRejection(apiRespMsg: String) extends ExchangeRejection {
+final case class InternalErrorRejection(apiRespMsg: String)(implicit acceptLang: Language) extends ExchangeRejection {
   def httpCode: StatusCodes.ServerError = HttpCode.INTERNAL_ERROR
   def apiRespCode: String = ApiRespType.INTERNAL_ERROR
 }
@@ -162,7 +163,7 @@ object ExchangePosgtresErrorHandling {
   def isDuplicateKeyError(serverError: org.postgresql.util.PSQLException): Boolean = {serverError.getServerErrorMessage.getMessage.contains("duplicate key") || serverError.getServerErrorMessage.getRoutine.contains("_bt_check_unique")}
   def isAccessDeniedError(serverError: org.postgresql.util.PSQLException): Boolean = {serverError.getMessage.startsWith("Access Denied:")}
   def isKeyNotFoundError(serverError: org.postgresql.util.PSQLException): Boolean = {serverError.getServerErrorMessage.getDetail.contains("is not present in table") || serverError.getServerErrorMessage.getRoutine.contains("ri_ReportViolation")}
-  def ioProblemError(serverError: org.postgresql.util.PSQLException, response: String): (StatusCode, ApiResponse) = {
+  def ioProblemError(serverError: org.postgresql.util.PSQLException, response: String)(implicit acceptLang: Language): (StatusCode, ApiResponse) = {
     if (serverError.getMessage.contains("An I/O error occurred")) (HttpCode.BAD_GW, ApiResponse(ApiRespType.BAD_GW, response))
     else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, response))
   }
@@ -171,8 +172,9 @@ object ExchangePosgtresErrorHandling {
 
 // Returns a msg from the translated files, with the args substituted
 object ExchMsg {
-  def translate(key: String, args: Any*): String = {
+  def translate(key: String, args: Any*)(implicit acceptLang: Language): String = {
     try {
+      println("accept lang: "+acceptLang.toString())
       //todo: remove these 2 debug statements
       val exchLang = sys.env.getOrElse("HZN_EXCHANGE_LANG", sys.env.getOrElse("LANG", "en"))
       if (exchLang.startsWith("zh") || exchLang.startsWith("pt")) println("using lang for msgs: "+exchLang)
@@ -199,6 +201,8 @@ object LogLevel {
 
 /** Global config parameters for the exchange. See typesafe config classes: http://typesafehub.github.io/config/latest/api/ */
 object ExchConfig {
+  val defaultLang = "en"
+  val supportedLang: Seq[Language] = List("de","es","fr","it","ja","ko","pt_BR","zh_CN","zh_TW")
   val configResourceName = "config.json"
   val configFileName: String = "/etc/horizon/exchange/" + configResourceName
   // The syntax called CONF is typesafe's superset of json that allows comments, etc. See https://github.com/typesafehub/config#using-hocon-the-json-superset. Strict json would be ConfigSyntax.JSON.

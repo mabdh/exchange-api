@@ -10,6 +10,7 @@ import com.horizon.exchangeapi.tables._
 import scala.concurrent.Await
 import scala.concurrent.duration._
 import scala.util.{ Failure, Success }
+import akka.http.scaladsl.model.headers.Language
 
 /** The umbrella class for the DB tables. The specific table classes are in the tables subdir. */
 object ExchangeApiTables {
@@ -83,7 +84,8 @@ object ExchangeApiTables {
     sqlu"drop table if exists bctypes cascade")
 
   /** Upgrades the db schema, or inits the db if necessary. Called every start up. */
-  def upgradeDb(db: Database)(implicit logger: LoggingAdapter, executionContext: ExecutionContext): Unit = {
+  def upgradeDb(db: Database)(implicit logger: LoggingAdapter, executionContext: ExecutionContext, acceptLang: Language): Unit = {
+    
     // Run this and wait for it, because we don't want any other initialization occurring until the db is right
     val upgradeNotNeededMsg = "DB schema does not need upgrading, it is already at the latest schema version: "
 

@@ -1,15 +1,17 @@
 package com.horizon.exchangeapi
 
 import akka.event.LoggingAdapter
+import akka.http.scaladsl.model.headers.Language
 import akka.http.scaladsl.server.{Directive, Directive0, ValidationRejection}
 import akka.http.scaladsl.server.Directive1
 import com.horizon.exchangeapi.Access.Access
 import com.horizon.exchangeapi.AuthenticationSupport._
-import javax.security.auth.login.{AppConfigurationEntry, Configuration}
 
+import javax.security.auth.login.{AppConfigurationEntry, Configuration}
 import scala.util.matching.Regex
 import akka.http.scaladsl.server.Directives._
 import com.horizon.exchangeapi.auth._
+
 import javax.security.auth.Subject
 import javax.security.auth.login.LoginContext
 import org.mindrot.jbcrypt.BCrypt
@@ -17,7 +19,6 @@ import pdi.jwt.{Jwt, JwtAlgorithm, JwtClaim}
 import slick.jdbc.PostgresProfile.api._
 
 import scala.jdk.CollectionConverters.CollectionHasAsScala
-
 import scala.util._
 import scala.concurrent.duration._
 import java.util.Base64
@@ -165,8 +166,9 @@ trait AuthenticationSupport extends AuthorizationSupport {
   
   // Custom directive to extract the Authorization header creds and authenticate/authorize to the exchange
   //someday: this must be used as a separate directive, don't yet know how to combine it with the other directives using &
-  def exchAuth(target: Target, access: Access, hint: String = ""): Directive1[Identity] = {
+  def exchAuth(target: Target, access: Access, hint: String = "")(implicit acceptLang: Language): Directive1[Identity] = {
     // val optEncodedAuth = ctx.request.getHeader("Authorization")
+
     extract(_.request.getHeader("Authorization")).flatMap { optEncodedAuth =>
       val encodedAuth: String = if (optEncodedAuth.isPresent) optEncodedAuth.get().value() else ""
       val optCreds: Option[Creds] = encodedAuth match {
@@ -207,7 +209,7 @@ trait AuthenticationSupport extends AuthorizationSupport {
   }
 
   /** Returns a temporary pw reset token. */
-  def createToken(username: String): String = {
+  def createToken(username: String)(implicit acceptLang: Language): String = {
     // Get their current pw to use as the secret
     AuthCache.getUser(username) match {
       case Some(userHashedTok) => Token.create(userHashedTok) // always create the token with the hashed pw because that will always be there during creation and validation of the token

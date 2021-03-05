@@ -25,6 +25,7 @@ import scala.collection.mutable.ListBuffer
 import scala.concurrent.Await
 import scala.concurrent.duration._
 import scala.util.{Failure, Success, Try}
+import akka.http.scaladsl.model.headers.Language
 
 // Credentials specified in the client request
 final case class IamAuthCredentials(org: String, keyType: String, key: String) {
@@ -83,6 +84,7 @@ class IbmCloudModule extends LoginModule with AuthorizationSupport {
     //logger.debug("in IbmCloudModule.login() to try to authenticate an IBM cloud user")
     val reqCallback = new RequestCallback
 
+    implicit val acceptLang: Language = implicitly[Language]
     handler.handle(Array(reqCallback))
     if (reqCallback.request.isEmpty) {
       logger.error("Unable to get HTTP request while authenticating")
@@ -174,7 +176,7 @@ object IbmCloudAuth {
   implicit val userCache = GuavaCache(guavaCache) // the effect of this is that these methods don't need to be qualified
 
   // Called by ExchangeApiApp after db is established and upgraded
-  def init(db: Database): Unit = {
+  def init(db: Database)(implicit acceptLang: Language): Unit = {
     this.db = db
     logger.info(s"IBM authentication-related env vars: PLATFORM_IDENTITY_PROVIDER_SERVICE_PORT=${sys.env.get("PLATFORM_IDENTITY_PROVIDER_SERVICE_PORT")}, ICP_EXTERNAL_MGMT_INGRESS=${sys.env.get("ICP_EXTERNAL_MGMT_INGRESS")}, ICP_MANAGEMENT_INGRESS_SERVICE_PORT=${sys.env.get("ICP_MANAGEMENT_INGRESS_SERVICE_PORT")}")
     if (isIcp) {
@@ -184,7 +186,7 @@ object IbmCloudAuth {
     }
   }
 
-  def authenticateUser(authInfo: IamAuthCredentials, hint: Option[String]): Try[String] = {
+  def authenticateUser(authInfo: IamAuthCredentials, hint: Option[String])(implicit acceptLang: Language): Try[String] = {
     logger.debug("authenticateUser(): attempting to authenticate with IBM Cloud with " + authInfo.org + "/" + authInfo.keyType)
 
     /*
@@ -261,7 +263,7 @@ object IbmCloudAuth {
 
   // Get the ICP cluster name as a Try[String] and cache it in member var icpClusterNameTry.
   // Note: we currently call this, but don't use the value for anything
-  private def getIcpClusterName: Try[String] = {
+  private def getIcpClusterName(implicit acceptLang: Language): Try[String] = {
     icpClusterNameTry match {
       case null =>
         icpClusterNameTry = _getIcpClusterName
@@ -283,7 +285,8 @@ object IbmCloudAuth {
   }
 
   // Internal method called from getIcpClusterName
-  private def _getIcpClusterName: Try[String] = {
+  private def _getIcpClusterName(implicit acceptLang: Language): Try[String] = {
+    
     for (i <- 1 to iamRetryNum) {
       try {
         // just get cluster name - works for both ICP 3.2.0 and 3.2.1
@@ -307,7 +310,8 @@ object IbmCloudAuth {
   }
 
   // Use the IBM IAM API to authenticate the iamapikey and get an IAM token. See: https://cloud.ibm.com/apidocs/iam-identity-token-api
-  private def getIamToken(authInfo: IamAuthCredentials): Try[IamToken] = {
+  private def getIamToken(authInfo: IamAuthCredentials)(implicit acceptLang: Language): Try[IamToken] = {
+    
     if (authInfo.keyType == "iamapikey") {
       // An IBM Cloud IAM platform api key
       var delayedReturn: Try[IamToken] = Failure(new IamApiTimeoutException(ExchMsg.translate("iam.return.value.not.set", "GET token", iamRetryNum)))
@@ -338,7 +342,8 @@ object IbmCloudAuth {
 
   // Using the IAM token get the ibm cloud account id (which we'll use to verify the exchange org) and users email (which we'll use as the exchange user)
   // For ICP IAM see: https://github.ibm.com/IBMPrivateCloud/roadmap/blob/master/feature-specs/security/security-services-apis.md
-  private def getUserInfo(token: IamToken, authInfo: IamAuthCredentials): Try[IamUserInfo] = {
+  private def getUserInfo(token: IamToken, authInfo: IamAuthCredentials)(implicit acceptLang: Language): Try[IamUserInfo] = {
+    
     if (isIcp && token.tokenType.getOrElse("") == "iamapikey") {
       // An icp platform apikey that we can use directly to authenticate and get the username
       var delayedReturn: Try[IamUserInfo] = Failure(new IamApiTimeoutException(ExchMsg.translate("iam.return.value.not.set", "GET introspect", iamRetryNum)))
@@ -413,13 +418,14 @@ object IbmCloudAuth {
     }
   }
 
-  def getOIDCToken(icpapikey: IamToken) : Try[IamToken]  = {
+  def getOIDCToken(icpapikey: IamToken)(implicit acceptLang: Language): Try[IamToken]  = {
     /*
     curl -k -X POST -H "Content-Type: application/x-www-form-urlencoded" -H "Accept: application/json"
     -d 'grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey=<api-key>&response_type=cloud_iam'
     "$CLUSTER_ADDRESS/iam-token/oidc/token"
      */
     logger.debug("getOIDCToken")
+    
     val oidcTokenURL = getIcpMgmtIngressUrl + "/iam-token/oidc/token"
     val response = Http(oidcTokenURL).method("post").option(HttpOptions.sslSocketFactory(this.sslSocketFactory))
       .header("Content-Type", "application/x-www-form-urlencoded")
@@ -432,7 +438,8 @@ object IbmCloudAuth {
     } else Failure(new InvalidCredentialsException(ExchMsg.translate("invalid.iam.token")))
   }
 
-  def getUserAccounts(token: IamToken, userInfo: IamUserInfo) : Try[List[IamAccountInfo]] = {
+  def getUserAccounts(token: IamToken, userInfo: IamUserInfo)(implicit acceptLang: Language) : Try[List[IamAccountInfo]] = {
+    
     if (isIcp){
       /*
         curl -k -X GET \
@@ -453,8 +460,9 @@ object IbmCloudAuth {
     } else Failure(new InvalidCredentialsException(ExchMsg.translate("api.access.denied")))
   }
 
-  private def getOrCreateUser(authInfo: IamAuthCredentials, userInfo: IamUserInfo, hint: Option[String], oidcToken: Option[IamToken]): Try[UserRow] = {
+  private def getOrCreateUser(authInfo: IamAuthCredentials, userInfo: IamUserInfo, hint: Option[String], oidcToken: Option[IamToken])(implicit acceptLang: Language): Try[UserRow] = {
     logger.debug("Getting or creating exchange user from DB using IAM userinfo: " + userInfo)
+    
     // Form a DB query with the right logic to verify the org and either get or create the user.
     // This can throw exceptions OrgNotFound or IncorrectOrgFound
     val userQuery =
@@ -510,7 +518,7 @@ object IbmCloudAuth {
 
   // Verify that the cloud acct id of the cloud api key and the exchange org entry match
   // authInfo is the creds they passed in, userInfo is what was returned from the IAM calls, and orgAcctId is what we got from querying the org in the db
-  private def fetchVerifyOrg(authInfo: IamAuthCredentials, userInfo: IamUserInfo, hint: Option[String], oidcToken: Option[IamToken]) = {
+  private def fetchVerifyOrg(authInfo: IamAuthCredentials, userInfo: IamUserInfo, hint: Option[String], oidcToken: Option[IamToken])(implicit acceptLang: Language) = {
     if (isIcp) {
       if (hint.getOrElse("") == "exchangeNoOrgForMultLogin") {
         DBIO.successful(null)

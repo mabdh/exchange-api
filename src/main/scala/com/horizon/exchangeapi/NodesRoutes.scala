@@ -26,6 +26,7 @@ import scala.collection.immutable._
 import scala.util._
 import scala.util.control.Breaks._
 import scala.util.matching.Regex
+import akka.http.scaladsl.model.headers.Language
 
 //====== These are the input and output structures for /orgs/{orgid}/nodes routes. Swagger and/or json seem to require they be outside the trait.
 
@@ -34,7 +35,8 @@ final case class GetNodesResponse(nodes: Map[String,Node], lastIndex: Int)
 final case class GetNodeAttributeResponse(attribute: String, value: String)
 
 object GetNodesUtils {
-  def getNodesProblem(nodetype: Option[String]): Option[String] = {
+  
+  def getNodesProblem(nodetype: Option[String])(implicit acceptLang: Language): Option[String] = {
     if (nodetype.isDefined && !NodeType.containsString(nodetype.get.toLowerCase)) return Some(ExchMsg.translate("invalid.node.type2", NodeType.valuesAsString))
     None
   }
@@ -102,8 +104,9 @@ final case class PutNodesRequest(token: String,
                                  heartbeatIntervals: Option[NodeHeartbeatIntervals]) {
   require(token!=null && name!=null && pattern!=null && publicKey!=null)
   protected implicit val jsonFormats: Formats = DefaultFormats
+  
   /** Halts the request with an error msg if the user input is invalid. */
-  def getAnyProblem(id: String, noheartbeat: Option[String]): Option[String] = {
+  def getAnyProblem(id: String, noheartbeat: Option[String])(implicit acceptLang: Language): Option[String] = {
     if (id == "iamapikey" || id == "iamtoken") return Some(ExchMsg.translate("node.id.not.iamapikey.or.iamtoken"))
     if (noheartbeat.isDefined && noheartbeat.get.toLowerCase != "true" && noheartbeat.get.toLowerCase != "false") return Some(ExchMsg.translate("bad.noheartbeat.param"))
     if (token == "") return Some(ExchMsg.translate("token.must.not.be.blank"))
@@ -172,8 +175,7 @@ final case class PutNodesRequest(token: String,
 
 final case class PatchNodesRequest(token: Option[String], name: Option[String], nodeType: Option[String], pattern: Option[String], registeredServices: Option[List[RegService]], userInput: Option[List[OneUserInputService]], msgEndPoint: Option[String], softwareVersions: Option[Map[String,String]], publicKey: Option[String], arch: Option[String], heartbeatIntervals: Option[NodeHeartbeatIntervals]) {
   protected implicit val jsonFormats: Formats = DefaultFormats
-
-  def getAnyProblem: Option[String] = {
+  def getAnyProblem(implicit acceptLang: Language): Option[String] = {
     if (token.isDefined && token.get == "") Some(ExchMsg.translate("token.cannot.be.empty.string"))
     //else if (!requestBody.trim.startsWith("{") && !requestBody.trim.endsWith("}")) Some(ExchMsg.translate("invalid.input.message", requestBody))
     else None
@@ -220,9 +222,10 @@ final case class PatchNodesRequest(token: Option[String], name: Option[String], 
 final case class PostNodeConfigStateRequest(org: String, url: String, configState: String) {
   require(org!=null && url!=null && configState!=null)
   protected implicit val jsonFormats: Formats = DefaultFormats
+  
   //def logger: Logger    // get access to the logger object in ExchangeApiApp
 
-  def getAnyProblem: Option[String] = {
+  def getAnyProblem(implicit acceptLang: Language): Option[String] = {
     if (configState != "suspended" && configState != "active") Some(ExchMsg.translate("configstate.must.be.suspended.or.active"))
     else None
   }
@@ -243,7 +246,8 @@ final case class PostNodeConfigStateRequest(org: String, url: String, configStat
   }
 
   // Given the existing list of registered svcs in the db for this node, determine the db update necessary to apply the new configState
-  def getDbUpdate(regServices: String, id: String): DBIO[_] = {
+  def getDbUpdate(regServices: String, id: String)(implicit acceptLang: Language): DBIO[_] = {
+    
     if (regServices == "") return DBIO.failed(new ResourceNotFoundException(ExchMsg.translate("node.has.no.services")))
     val regSvcs: Seq[RegService] = read[List[RegService]](regServices)
     if (regSvcs.isEmpty) return DBIO.failed(new ResourceNotFoundException(ExchMsg.translate("node.has.no.services")))
@@ -295,7 +299,7 @@ final case class PutNodeErrorRequest(errors: List[Any]) {
 
 final case class PutNodePolicyRequest(label: Option[String], description: Option[String], properties: Option[List[OneProperty]], constraints: Option[List[String]]) {
   protected implicit val jsonFormats: Formats = DefaultFormats
-  def getAnyProblem(noheartbeat: Option[String]): Option[String] = {
+  def getAnyProblem(noheartbeat: Option[String])(implicit acceptLang: Language): Option[String] = {
     if (noheartbeat.isDefined && noheartbeat.get.toLowerCase != "true" && noheartbeat.get.toLowerCase != "false") return Some(ExchMsg.translate("bad.noheartbeat.param"))
     val validTypes: Set[String] = Set("string", "int", "float", "boolean", "list of strings", "version")
     for (p <- properties.getOrElse(List())) {
@@ -317,7 +321,8 @@ final case class GetNodeAgreementsResponse(agreements: Map[String,NodeAgreement]
 final case class PutNodeAgreementRequest(services: Option[List[NAService]], agreementService: Option[NAgrService], state: String) {
   require(state!=null)
   protected implicit val jsonFormats: Formats = DefaultFormats
-  def getAnyProblem(noheartbeat: Option[String]): Option[String] = {
+  
+  def getAnyProblem(noheartbeat: Option[String])(implicit acceptLang: Language): Option[String] = {
     if (noheartbeat.isDefined && noheartbeat.get.toLowerCase != "true" && noheartbeat.get.toLowerCase != "false") return Some(ExchMsg.translate("bad.noheartbeat.param"))
     if (services.isEmpty && agreementService.isEmpty) {
       return Some(ExchMsg.translate("must.specify.service.or.agreementservice"))
@@ -474,38 +479,54 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node")
   def nodesGetRoute: Route = (path("orgs" / Segment / "nodes") & get & parameter((Symbol("idfilter").?, Symbol("name").?, Symbol("owner").?, Symbol("arch").?, Symbol("nodetype").?))) { (orgid, idfilter, name, owner, arch, nodetype) =>
+    
     logger.debug(s"Doing GET /orgs/$orgid/nodes")
-    exchAuth(TNode(OrgAndId(orgid,"#").toString), Access.READ) { ident =>
-      validateWithMsg(GetNodesUtils.getNodesProblem(nodetype)) {
-        complete({
-          logger.debug(s"GET /orgs/$orgid/nodes identity: ${ident.creds.id}") // can't display the whole ident object, because that contains the pw/token
-          var q = NodesTQ.getAllNodes(orgid)
-          idfilter.foreach(id => { if (id.contains("%")) q = q.filter(_.id like id) else q = q.filter(_.id === id) })
-          name.foreach(name => { if (name.contains("%")) q = q.filter(_.name like name) else q = q.filter(_.name === name) })
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(OrgAndId(orgid, "#").toString), Access.READ) { ident =>
+        validateWithMsg(GetNodesUtils.getNodesProblem(nodetype)) {
+          complete({
+            logger.debug(s"GET /orgs/$orgid/nodes identity: ${ident.creds.id}") // can't display the whole ident object, because that contains the pw/token
+            var q = NodesTQ.getAllNodes(orgid)
+            idfilter.foreach(id => {
+              if (id.contains("%")) q = q.filter(_.id like id) else q = q.filter(_.id === id)
+            })
+            name.foreach(name => {
+              if (name.contains("%")) q = q.filter(_.name like name) else q = q.filter(_.name === name)
+            })
 
-          if (ident.isAdmin || ident.role.equals(AuthRoles.Agbot)) {
-              owner.foreach(owner => { if (owner.contains("%")) q = q.filter(_.owner like owner) else q = q.filter(_.owner === owner) })
-          } else q = q.filter(_.owner === ident.identityString)
+            if (ident.isAdmin || ident.role.equals(AuthRoles.Agbot)) {
+              owner.foreach(owner => {
+                if (owner.contains("%")) q = q.filter(_.owner like owner) else q = q.filter(_.owner === owner)
+              })
+            } else q = q.filter(_.owner === ident.identityString)
 
-          owner.foreach(owner => { if (owner.contains("%")) q = q.filter(_.owner like owner) else q = q.filter(_.owner === owner) })
-          arch.foreach(arch => { if (arch.contains("%")) q = q.filter(_.arch like arch) else q = q.filter(_.arch === arch) })
+            owner.foreach(owner => {
+              if (owner.contains("%")) q = q.filter(_.owner like owner) else q = q.filter(_.owner === owner)
+            })
+            arch.foreach(arch => {
+              if (arch.contains("%")) q = q.filter(_.arch like arch) else q = q.filter(_.arch === arch)
+            })
 
-          if (nodetype.isDefined) {
-            val nt: String = nodetype.get.toLowerCase
-            if (NodeType.isDevice(nt)) q = q.filter(r => {r.nodeType === nt || r.nodeType === ""})
-            else if (NodeType.isCluster(nt)) q = q.filter(_.nodeType === nt)
-          }
+            if (nodetype.isDefined) {
+              val nt: String = nodetype.get.toLowerCase
+              if (NodeType.isDevice(nt)) q = q.filter(r => {
+                r.nodeType === nt || r.nodeType === ""
+              })
+              else if (NodeType.isCluster(nt)) q = q.filter(_.nodeType === nt)
+            }
 
-          db.run(q.result).map({ list =>
-            logger.debug(s"GET /orgs/$orgid/nodes result size: ${list.size}")
-            //val nodes = NodesTQ.parseJoin(ident.isSuperUser, list)
-            val nodes: Map[String, Node] = list.map(e => e.id -> e.toNode(ident.isSuperUser)).toMap
-            val code: StatusCode with Serializable = if (nodes.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-            (code, GetNodesResponse(nodes, 0))
-          })
-        }) // end of complete
-      }
-    } // end of exchAuth
+            db.run(q.result).map({ list =>
+              logger.debug(s"GET /orgs/$orgid/nodes result size: ${list.size}")
+              //val nodes = NodesTQ.parseJoin(ident.isSuperUser, list)
+              val nodes: Map[String, Node] = list.map(e => e.id -> e.toNode(ident.isSuperUser)).toMap
+              val code: StatusCode with Serializable = if (nodes.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+              (code, GetNodesResponse(nodes, 0))
+            })
+          }) // end of complete
+        }
+      } // end of exchAuth
+    }
   }
   
   /* ====== GET /orgs/{orgid}/nodes/{id} ================================ */
@@ -603,37 +624,41 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node")
   def nodeGetRoute: Route = (path("orgs" / Segment / "nodes" / Segment) & get & parameter((Symbol("attribute").?))) { (orgid, id, attribute) =>
     logger.debug(s"Doing GET /orgs/$orgid/nodes/$id")
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.READ) { ident =>
-      val q = if (attribute.isDefined) NodesTQ.getAttribute(compositeId, attribute.get) else null
-      validate(attribute.isEmpty || q!= null, ExchMsg.translate("node.name.not.in.resource")) {
-        complete({
-          attribute match {
-            case Some(attr) =>  // Only returning 1 attr of the node
-              val q = NodesTQ.getAttribute(compositeId, attr)
-              if (q == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("not.a.node.attribute", attr)))
-              else db.run(q.result).map({ list =>
-                logger.debug("GET /orgs/"+orgid+"/nodes/"+id+" attribute result: "+list.size)
-                if (list.nonEmpty) (HttpCode.OK, GetNodeAttributeResponse(attr, list.head.toString))
-                else(HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))     // validateAccessToNode() will return ApiRespType.NOT_FOUND to the client so do that here for consistency
-              })
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.READ) { ident =>
+        val q = if (attribute.isDefined) NodesTQ.getAttribute(compositeId, attribute.get) else null
+        validate(attribute.isEmpty || q != null, ExchMsg.translate("node.name.not.in.resource")) {
+          complete({
+            attribute match {
+              case Some(attr) => // Only returning 1 attr of the node
+                val q = NodesTQ.getAttribute(compositeId, attr)
+                if (q == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("not.a.node.attribute", attr)))
+                else db.run(q.result).map({ list =>
+                  logger.debug("GET /orgs/" + orgid + "/nodes/" + id + " attribute result: " + list.size)
+                  if (list.nonEmpty) (HttpCode.OK, GetNodeAttributeResponse(attr, list.head.toString))
+                  else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found"))) // validateAccessToNode() will return ApiRespType.NOT_FOUND to the client so do that here for consistency
+                })
 
-            case None =>   // Return the whole node
-              val q = NodesTQ.getNode(compositeId)
-              db.run(q.result).map({ list =>
-                logger.debug("GET /orgs/"+orgid+"/nodes/"+id+" result: "+list.size)
-                if (list.nonEmpty) {
-                  //val nodes = NodesTQ.parseJoin(ident.isSuperUser, list)
-                  val nodes: Map[String, Node] = list.map(e => e.id -> e.toNode(ident.isSuperUser)).toMap
-                  (HttpCode.OK, GetNodesResponse(nodes, 0))
-                } else {
-                  (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))     // validateAccessToNode() will return ApiRespType.NOT_FOUND to the client so do that here for consistency
-                }
-              })
-          }
-        }) // end of complete
-      } // end of validate
-    } // end of exchAuth
+              case None => // Return the whole node
+                val q = NodesTQ.getNode(compositeId)
+                db.run(q.result).map({ list =>
+                  logger.debug("GET /orgs/" + orgid + "/nodes/" + id + " result: " + list.size)
+                  if (list.nonEmpty) {
+                    //val nodes = NodesTQ.parseJoin(ident.isSuperUser, list)
+                    val nodes: Map[String, Node] = list.map(e => e.id -> e.toNode(ident.isSuperUser)).toMap
+                    (HttpCode.OK, GetNodesResponse(nodes, 0))
+                  } else {
+                    (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found"))) // validateAccessToNode() will return ApiRespType.NOT_FOUND to the client so do that here for consistency
+                  }
+                })
+            }
+          }) // end of complete
+        } // end of validate
+      } // end of exchAuth
+    }
   }
 
   // =========== PUT /orgs/{orgid}/nodes/{id} ===============================
@@ -743,133 +768,140 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node")
   def nodePutRoute: Route = (path("orgs" / Segment / "nodes" / Segment) & put & parameter((Symbol("noheartbeat").?)) & entity(as[PutNodesRequest])) { (orgid, id, noheartbeat, reqBody) =>
     logger.debug(s"Doing PUT /orgs/$orgid/nodes/$id")
+    
     val compositeId: String = OrgAndId(orgid, id).toString
     var orgMaxNodes = 0
-    exchAuth(TNode(compositeId), Access.WRITE) { ident =>
-      validateWithMsg(reqBody.getAnyProblem(id, noheartbeat)) {
-        complete({
-          val noHB = if (noheartbeat.isEmpty) false else if (noheartbeat.get.toLowerCase == "true") true else false
-          var orgLimitMaxNodes = 0
-          var fivePercentWarning = false
-          val owner: String = ident match { case IUser(creds) => creds.id; case _ => "" }
-          val patValidateAction = if (reqBody.pattern != "") PatternsTQ.getPattern(reqBody.pattern).length.result else DBIO.successful(1)
-          val (valServiceIdActions, svcRefs) = reqBody.validateServiceIds  // to check that the services referenced in userInput exist
-          db.run(patValidateAction.asTry.flatMap({
-            case Success(num) =>
-              // Check if pattern exists, then get services referenced
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " pattern validation: " + num)
-              if (num > 0) valServiceIdActions.asTry
-              else DBIO.failed(new Throwable(ExchMsg.translate("pattern.not.in.exchange"))).asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })
-          .flatMap({
-            case Success(v) =>
-              // Check if referenced services exist, then get whether node is using policy
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " service validation: " + v)
-              var invalidIndex: Int = -1 // v is a vector of Int (the length of each service query). If any are zero we should error out.
-              breakable {
-                for ((len, index) <- v.zipWithIndex) {
-                  if (len <= 0) {
-                    invalidIndex = index
-                    break()
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { ident =>
+        validateWithMsg(reqBody.getAnyProblem(id, noheartbeat)) {
+          complete({
+            val noHB = if (noheartbeat.isEmpty) false else if (noheartbeat.get.toLowerCase == "true") true else false
+            var orgLimitMaxNodes = 0
+            var fivePercentWarning = false
+            val owner: String = ident match {
+              case IUser(creds) => creds.id;
+              case _ => ""
+            }
+            val patValidateAction = if (reqBody.pattern != "") PatternsTQ.getPattern(reqBody.pattern).length.result else DBIO.successful(1)
+            val (valServiceIdActions, svcRefs) = reqBody.validateServiceIds // to check that the services referenced in userInput exist
+            db.run(patValidateAction.asTry.flatMap({
+              case Success(num) =>
+                // Check if pattern exists, then get services referenced
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " pattern validation: " + num)
+                if (num > 0) valServiceIdActions.asTry
+                else DBIO.failed(new Throwable(ExchMsg.translate("pattern.not.in.exchange"))).asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })
+              .flatMap({
+                case Success(v) =>
+                  // Check if referenced services exist, then get whether node is using policy
+                  logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " service validation: " + v)
+                  var invalidIndex: Int = -1 // v is a vector of Int (the length of each service query). If any are zero we should error out.
+                  breakable {
+                    for ((len, index) <- v.zipWithIndex) {
+                      if (len <= 0) {
+                        invalidIndex = index
+                        break()
+                      }
+                    }
                   }
-                }
-              }
-              if (invalidIndex < 0) NodesTQ.getNodeUsingPolicy(compositeId).result.asTry
-              else {
-                val errStr: String = if (invalidIndex < svcRefs.length) ExchMsg.translate("service.not.in.exchange.no.index", svcRefs(invalidIndex).org, svcRefs(invalidIndex).url, svcRefs(invalidIndex).versionRange, svcRefs(invalidIndex).arch)
-                else ExchMsg.translate("service.not.in.exchange.index", Nth(invalidIndex + 1))
-                DBIO.failed(new Throwable(errStr)).asTry
-              }
-            case Failure(t) => DBIO.failed(t).asTry
-          })
-          .flatMap({
-            case Success(v) =>
-              // Check if node is using policy, then get num nodes already owned
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " policy related attrs: " + v)
-              if (v.nonEmpty) {
-                val (existingPattern, existingPublicKey) = v.head
-                if (reqBody.pattern != "" && existingPattern == "" && existingPublicKey != "") DBIO.failed(new Throwable(ExchMsg.translate("not.pattern.when.policy"))).asTry
-                else OrgsTQ.getLimits(orgid).result.asTry // they are not trying to switch from policy to pattern, so we can continue
-              }
-              else OrgsTQ.getLimits(orgid).result.asTry // node doesn't exit yet, we can continue
-            case Failure(t) => DBIO.failed(t).asTry
-          })
-          .flatMap({
-            case Success(orgLimits) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " orgLimits: " + orgLimits)
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " orgLimits.head: " + orgLimits.head)
-              val limits : OrgLimits = OrgLimits.toOrgLimit(orgLimits.head)
-              orgLimitMaxNodes = limits.maxNodes
-              orgMaxNodes = orgLimitMaxNodes
-              NodesTQ.getAllNodes(orgid).length.result.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })
-          .flatMap({
-            case Success(totalNodes) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " total number of nodes in org: " + totalNodes)
-              if (orgLimitMaxNodes == 0) NodesTQ.getNumOwned(owner).result.asTry // no limit set
-              else if (totalNodes >= orgLimitMaxNodes) DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.org.max.limit.of.nodes", totalNodes, orgLimitMaxNodes))).asTry
-              else if ((orgLimitMaxNodes-totalNodes) <= orgLimitMaxNodes*.05) { // if we are within 5% of the limit
-                fivePercentWarning = true // used for warning later
-                NodesTQ.getNumOwned(owner).result.asTry
-              } else NodesTQ.getNumOwned(owner).result.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })
-          .flatMap({
-            case Success(numOwned) =>
-              // Check if num nodes owned is below limit, then create/update node
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " num owned: " + numOwned)
-              val maxNodes: Int = ExchConfig.getInt("api.limits.maxNodes")
-              if (maxNodes == 0
-                  || numOwned <= maxNodes
-                  || owner == "")  // when owner=="" we know it is only an update, otherwise we are not sure, but if they are already over the limit, stop them anyway
-                NodesTQ.getLastHeartbeat(compositeId).result.asTry
-              else
-                DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.max.limit.of.nodes", maxNodes))).asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })
-          .flatMap({
-            case Success(lastHeartbeat) => 
-              lastHeartbeat.size match {
-                  case 0 => val lastHB = if (noHB) None else Some(ApiTime.nowUTC)
-                    (if (owner == "")
-                        // It seems like this case is an error (node doesn't exist yet, and client is not a user). The update will fail, but probably not with an error that will really explain what they did wrong.
+                  if (invalidIndex < 0) NodesTQ.getNodeUsingPolicy(compositeId).result.asTry
+                  else {
+                    val errStr: String = if (invalidIndex < svcRefs.length) ExchMsg.translate("service.not.in.exchange.no.index", svcRefs(invalidIndex).org, svcRefs(invalidIndex).url, svcRefs(invalidIndex).versionRange, svcRefs(invalidIndex).arch)
+                    else ExchMsg.translate("service.not.in.exchange.index", Nth(invalidIndex + 1))
+                    DBIO.failed(new Throwable(errStr)).asTry
+                  }
+                case Failure(t) => DBIO.failed(t).asTry
+              })
+              .flatMap({
+                case Success(v) =>
+                  // Check if node is using policy, then get num nodes already owned
+                  logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " policy related attrs: " + v)
+                  if (v.nonEmpty) {
+                    val (existingPattern, existingPublicKey) = v.head
+                    if (reqBody.pattern != "" && existingPattern == "" && existingPublicKey != "") DBIO.failed(new Throwable(ExchMsg.translate("not.pattern.when.policy"))).asTry
+                    else OrgsTQ.getLimits(orgid).result.asTry // they are not trying to switch from policy to pattern, so we can continue
+                  }
+                  else OrgsTQ.getLimits(orgid).result.asTry // node doesn't exit yet, we can continue
+                case Failure(t) => DBIO.failed(t).asTry
+              })
+              .flatMap({
+                case Success(orgLimits) =>
+                  logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " orgLimits: " + orgLimits)
+                  logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " orgLimits.head: " + orgLimits.head)
+                  val limits: OrgLimits = OrgLimits.toOrgLimit(orgLimits.head)
+                  orgLimitMaxNodes = limits.maxNodes
+                  orgMaxNodes = orgLimitMaxNodes
+                  NodesTQ.getAllNodes(orgid).length.result.asTry
+                case Failure(t) => DBIO.failed(t).asTry
+              })
+              .flatMap({
+                case Success(totalNodes) =>
+                  logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " total number of nodes in org: " + totalNodes)
+                  if (orgLimitMaxNodes == 0) NodesTQ.getNumOwned(owner).result.asTry // no limit set
+                  else if (totalNodes >= orgLimitMaxNodes) DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.org.max.limit.of.nodes", totalNodes, orgLimitMaxNodes))).asTry
+                  else if ((orgLimitMaxNodes - totalNodes) <= orgLimitMaxNodes * .05) { // if we are within 5% of the limit
+                    fivePercentWarning = true // used for warning later
+                    NodesTQ.getNumOwned(owner).result.asTry
+                  } else NodesTQ.getNumOwned(owner).result.asTry
+                case Failure(t) => DBIO.failed(t).asTry
+              })
+              .flatMap({
+                case Success(numOwned) =>
+                  // Check if num nodes owned is below limit, then create/update node
+                  logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " num owned: " + numOwned)
+                  val maxNodes: Int = ExchConfig.getInt("api.limits.maxNodes")
+                  if (maxNodes == 0
+                    || numOwned <= maxNodes
+                    || owner == "") // when owner=="" we know it is only an update, otherwise we are not sure, but if they are already over the limit, stop them anyway
+                    NodesTQ.getLastHeartbeat(compositeId).result.asTry
+                  else
+                    DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.max.limit.of.nodes", maxNodes))).asTry
+                case Failure(t) => DBIO.failed(t).asTry
+              })
+              .flatMap({
+                case Success(lastHeartbeat) =>
+                  lastHeartbeat.size match {
+                    case 0 => val lastHB = if (noHB) None else Some(ApiTime.nowUTC)
+                      (if (owner == "")
+                      // It seems like this case is an error (node doesn't exist yet, and client is not a user). The update will fail, but probably not with an error that will really explain what they did wrong.
                         reqBody.getDbUpdate(compositeId, orgid, owner, Password.hash(reqBody.token), lastHB)
-                      else 
+                      else
                         reqBody.getDbUpsert(compositeId, orgid, owner, Password.hash(reqBody.token), lastHB)).transactionally.asTry
-                  case 1 => val lastHB = if (noHB) lastHeartbeat.head else Some(ApiTime.nowUTC)
-                    (if (owner == "") 
+                    case 1 => val lastHB = if (noHB) lastHeartbeat.head else Some(ApiTime.nowUTC)
+                      (if (owner == "")
                         reqBody.getDbUpdate(compositeId, orgid, owner, Password.hash(reqBody.token), lastHB)
-                      else 
+                      else
                         reqBody.getDbUpsert(compositeId, orgid, owner, Password.hash(reqBody.token), lastHB)).transactionally.asTry
-                  case _ => DBIO.failed(new DBProcessingError(HttpCode.INTERNAL_ERROR, ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.not.inserted.or.updated", compositeId, "Unexpected result"))).asTry
-                }
-            case Failure(t) => DBIO.failed(t).asTry
-          })
-          .flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODE, ResChangeOperation.CREATEDMODIFIED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              // Check creation/update of node, and other errors
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
-              AuthCache.putNodeAndOwner(compositeId, Password.hash(reqBody.token), reqBody.token, owner)
-              if (fivePercentWarning) (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("num.nodes.near.org.limit", orgid, orgMaxNodes)))
-              else (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.added.or.updated")))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getServerErrorMessage))
-            case Failure(t) =>
-              (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+                    case _ => DBIO.failed(new DBProcessingError(HttpCode.INTERNAL_ERROR, ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.not.inserted.or.updated", compositeId, "Unexpected result"))).asTry
+                  }
+                case Failure(t) => DBIO.failed(t).asTry
+              })
+              .flatMap({
+                case Success(v) =>
+                  // Add the resource to the resourcechanges table
+                  logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " result: " + v)
+                  ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODE, ResChangeOperation.CREATEDMODIFIED).insert.asTry
+                case Failure(t) => DBIO.failed(t).asTry
+              })).map({
+              case Success(v) =>
+                // Check creation/update of node, and other errors
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
+                AuthCache.putNodeAndOwner(compositeId, Password.hash(reqBody.token), reqBody.token, owner)
+                if (fivePercentWarning) (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("num.nodes.near.org.limit", orgid, orgMaxNodes)))
+                else (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.added.or.updated")))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getServerErrorMessage))
+              case Failure(t) =>
+                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== PATCH /orgs/{orgid}/nodes/{id} ===============================
@@ -945,84 +977,88 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node")
   def nodePatchRoute: Route = (path("orgs" / Segment / "nodes" / Segment) & patch & entity(as[PatchNodesRequest])) { (orgid, id, reqBody) =>
     logger.debug(s"Doing PATCH /orgs/$orgid/nodes/$id")
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          val hashedPw: String = if (reqBody.token.isDefined) Password.hash(reqBody.token.get) else "" // hash the token if that is what is being updated
-          val (action, attrName) = reqBody.getDbUpdate(compositeId, hashedPw)
-          if (action == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("no.valid.note.attr.specified")))
-          else {
-            val patValidateAction = if (attrName == "pattern" && reqBody.pattern.get != "") PatternsTQ.getPattern(reqBody.pattern.get).length.result else DBIO.successful(1)
-            val (valServiceIdActions, svcRefs) = if (attrName == "userInput") NodesTQ.validateServiceIds(reqBody.userInput.get) else (DBIO.successful(Vector()), Vector())
-            db.run(patValidateAction.asTry.flatMap({
-              case Success(num) =>
-                // Check if pattern exists, then get services referenced
-                logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " pattern validation: " + num)
-                if (num > 0) valServiceIdActions.asTry
-                else DBIO.failed(new Throwable(ExchMsg.translate("pattern.not.in.exchange"))).asTry
-              case Failure(t) => DBIO.failed(t).asTry
-            }).flatMap({
-              case Success(v) =>
-                // Check if referenced services exist, then get whether node is using policy
-                logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " service validation: " + v)
-                var invalidIndex: Int = -1 // v is a vector of Int (the length of each service query). If any are zero we should error out.
-                breakable {
-                  for ((len, index) <- v.zipWithIndex) {
-                    if (len <= 0) {
-                      invalidIndex = index
-                      break()
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            val hashedPw: String = if (reqBody.token.isDefined) Password.hash(reqBody.token.get) else "" // hash the token if that is what is being updated
+            val (action, attrName) = reqBody.getDbUpdate(compositeId, hashedPw)
+            if (action == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("no.valid.note.attr.specified")))
+            else {
+              val patValidateAction = if (attrName == "pattern" && reqBody.pattern.get != "") PatternsTQ.getPattern(reqBody.pattern.get).length.result else DBIO.successful(1)
+              val (valServiceIdActions, svcRefs) = if (attrName == "userInput") NodesTQ.validateServiceIds(reqBody.userInput.get) else (DBIO.successful(Vector()), Vector())
+              db.run(patValidateAction.asTry.flatMap({
+                case Success(num) =>
+                  // Check if pattern exists, then get services referenced
+                  logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " pattern validation: " + num)
+                  if (num > 0) valServiceIdActions.asTry
+                  else DBIO.failed(new Throwable(ExchMsg.translate("pattern.not.in.exchange"))).asTry
+                case Failure(t) => DBIO.failed(t).asTry
+              }).flatMap({
+                case Success(v) =>
+                  // Check if referenced services exist, then get whether node is using policy
+                  logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " service validation: " + v)
+                  var invalidIndex: Int = -1 // v is a vector of Int (the length of each service query). If any are zero we should error out.
+                  breakable {
+                    for ((len, index) <- v.zipWithIndex) {
+                      if (len <= 0) {
+                        invalidIndex = index
+                        break()
+                      }
                     }
                   }
-                }
-                if (invalidIndex < 0) NodesTQ.getNodeUsingPolicy(compositeId).result.asTry
-                else {
-                  val errStr: String = if (invalidIndex < svcRefs.length) ExchMsg.translate("service.not.in.exchange.no.index", svcRefs(invalidIndex).org, svcRefs(invalidIndex).url, svcRefs(invalidIndex).versionRange, svcRefs(invalidIndex).arch)
-                  else ExchMsg.translate("service.not.in.exchange.index", Nth(invalidIndex + 1))
-                  DBIO.failed(new Throwable(errStr)).asTry
-                }
-              case Failure(t) => DBIO.failed(t).asTry
-            }).flatMap({
-              case Success(v) =>
-                // Check if node is using policy, then update node
-                logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " policy related attrs: " + v)
-                if (v.nonEmpty) {
-                  val (existingPattern, existingPublicKey) = v.head
-                  if (reqBody.pattern.getOrElse("") != "" && existingPattern == "" && existingPublicKey != "") DBIO.failed(new Throwable(ExchMsg.translate("not.pattern.when.policy"))).asTry
-                  else action.transactionally.asTry // they are not trying to switch from policy to pattern, so we can continue
-                }
-                else action.transactionally.asTry // node doesn't exit yet, we can continue
-              case Failure(t) => DBIO.failed(t).asTry
-            }).flatMap({
-              case Success(v) =>
-                // Add the resource to the resourcechanges table
-                logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " result: " + v)
-                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODE, ResChangeOperation.MODIFIED).insert.asTry
-              case Failure(t) => DBIO.failed(t).asTry
-            })).map({
-              case Success(v) =>
-                logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
-                try {
-                  val numUpdated: Int = v.toString.toInt // v comes to us as type Any
-                  if (numUpdated > 0) { // there were no db errors, but determine if it actually found it or not
-                    if (reqBody.token.isDefined) AuthCache.putNode(compositeId, hashedPw, reqBody.token.get) // We do not need to run putOwner because patch does not change the owner
-                    (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.attribute.updated", attrName, compositeId)))
-                  } else {
-                    (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
+                  if (invalidIndex < 0) NodesTQ.getNodeUsingPolicy(compositeId).result.asTry
+                  else {
+                    val errStr: String = if (invalidIndex < svcRefs.length) ExchMsg.translate("service.not.in.exchange.no.index", svcRefs(invalidIndex).org, svcRefs(invalidIndex).url, svcRefs(invalidIndex).versionRange, svcRefs(invalidIndex).arch)
+                    else ExchMsg.translate("service.not.in.exchange.index", Nth(invalidIndex + 1))
+                    DBIO.failed(new Throwable(errStr)).asTry
                   }
-                } catch {
-                  case e: Exception => (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("unexpected.result.from.update", e)))
-                }
-              case Failure(t: org.postgresql.util.PSQLException) =>
-                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage))
-              case Failure(t) =>
-                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage)))
+                case Failure(t) => DBIO.failed(t).asTry
+              }).flatMap({
+                case Success(v) =>
+                  // Check if node is using policy, then update node
+                  logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " policy related attrs: " + v)
+                  if (v.nonEmpty) {
+                    val (existingPattern, existingPublicKey) = v.head
+                    if (reqBody.pattern.getOrElse("") != "" && existingPattern == "" && existingPublicKey != "") DBIO.failed(new Throwable(ExchMsg.translate("not.pattern.when.policy"))).asTry
+                    else action.transactionally.asTry // they are not trying to switch from policy to pattern, so we can continue
+                  }
+                  else action.transactionally.asTry // node doesn't exit yet, we can continue
+                case Failure(t) => DBIO.failed(t).asTry
+              }).flatMap({
+                case Success(v) =>
+                  // Add the resource to the resourcechanges table
+                  logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " result: " + v)
+                  ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODE, ResChangeOperation.MODIFIED).insert.asTry
+                case Failure(t) => DBIO.failed(t).asTry
+              })).map({
+                case Success(v) =>
+                  logger.debug("PATCH /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
+                  try {
+                    val numUpdated: Int = v.toString.toInt // v comes to us as type Any
+                    if (numUpdated > 0) { // there were no db errors, but determine if it actually found it or not
+                      if (reqBody.token.isDefined) AuthCache.putNode(compositeId, hashedPw, reqBody.token.get) // We do not need to run putOwner because patch does not change the owner
+                      (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.attribute.updated", attrName, compositeId)))
+                    } else {
+                      (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
+                    }
+                  } catch {
+                    case e: Exception => (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("unexpected.result.from.update", e)))
+                  }
+                case Failure(t: org.postgresql.util.PSQLException) =>
+                  ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage))
+                case Failure(t) =>
+                  (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage)))
 
-            })
-          }
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+              })
+            }
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/nodes/{id}/services_configstate ===============================
@@ -1086,36 +1122,40 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node")
   def nodePostConfigStateRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "services_configstate") & post & entity(as[PostNodeConfigStateRequest])) { (orgid, id, reqBody) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          db.run(NodesTQ.getRegisteredServices(compositeId).result.asTry.flatMap({
-            case Success(v) =>
-              logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/configstate result: " + v)
-              if (v.nonEmpty) reqBody.getDbUpdate(v.head, compositeId).asTry // pass the update action to the next step
-              else DBIO.failed(new Throwable("Invalid Input: node " + compositeId + " not found")).asTry // it seems this returns success even when the node is not found
-            case Failure(t) => DBIO.failed(t).asTry // rethrow the error to the next step. Is this necessary, or will flatMap do that automatically?
-          }).flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/configstate write row result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODESERVICES_CONFIGSTATE, ResChangeOperation.CREATED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(n) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + n)
-              if (n.asInstanceOf[Int] > 0) (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.services.updated", compositeId))) // there were no db errors, but determine if it actually found it or not
-              else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
-            case Failure(t: AuthException) => t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage))
-            case Failure(t) =>
-              (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            db.run(NodesTQ.getRegisteredServices(compositeId).result.asTry.flatMap({
+              case Success(v) =>
+                logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/configstate result: " + v)
+                if (v.nonEmpty) reqBody.getDbUpdate(v.head, compositeId).asTry // pass the update action to the next step
+                else DBIO.failed(new Throwable("Invalid Input: node " + compositeId + " not found")).asTry // it seems this returns success even when the node is not found
+              case Failure(t) => DBIO.failed(t).asTry // rethrow the error to the next step. Is this necessary, or will flatMap do that automatically?
+            }).flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/configstate write row result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODESERVICES_CONFIGSTATE, ResChangeOperation.CREATED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(n) =>
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + n)
+                if (n.asInstanceOf[Int] > 0) (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.services.updated", compositeId))) // there were no db errors, but determine if it actually found it or not
+                else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
+              case Failure(t: AuthException) => t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage))
+              case Failure(t) =>
+                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("node.not.inserted.or.updated", compositeId, t.getMessage)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/nodes/{id} ===============================
@@ -1133,35 +1173,39 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node")
   def nodeDeleteRoute: Route = (path("orgs" / Segment / "nodes" / Segment) & delete) { (orgid, id) =>
     logger.debug(s"Doing DELETE /orgs/$orgid/nodes/$id")
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.WRITE) { _ =>
-      complete({
-        // remove does *not* throw an exception if the key does not exist
-        db.run(NodesTQ.getNode(compositeId).delete.transactionally.asTry.flatMap({
-          case Success(v) =>
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              logger.debug(s"DELETE /orgs/$orgid/nodes/$id result: $v")
-              AuthCache.removeNodeAndOwner(compositeId)
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODE, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug(s"DELETE /orgs/$orgid/nodes/$id updated in changes table: $v")
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            if (t.getMessage.contains("couldn't find node")) (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            if (t.getMessage.contains("couldn't find node")) (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
-            else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        complete({
+          // remove does *not* throw an exception if the key does not exist
+          db.run(NodesTQ.getNode(compositeId).delete.transactionally.asTry.flatMap({
+            case Success(v) =>
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                logger.debug(s"DELETE /orgs/$orgid/nodes/$id result: $v")
+                AuthCache.removeNodeAndOwner(compositeId)
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODE, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug(s"DELETE /orgs/$orgid/nodes/$id updated in changes table: $v")
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              if (t.getMessage.contains("couldn't find node")) (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              if (t.getMessage.contains("couldn't find node")) (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
+              else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/nodes/{id}/heartbeat ===============================
@@ -1180,23 +1224,27 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node")
   def nodeHeartbeatRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "heartbeat") & post) { (orgid, id) =>
     logger.debug(s"Doing POST /orgs/$orgid/users/$id/heartbeat")
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.WRITE) { _ =>
-      complete({
-        db.run(NodesTQ.getLastHeartbeat(compositeId).update(Some(ApiTime.nowUTC)).asTry).map({
-          case Success(v) =>
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              logger.debug(s"POST /orgs/$orgid/users/$id/heartbeat result: $v")
-              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.updated")))
-            } else {
-              (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
-            }
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.updated", compositeId, t.toString))
-          case Failure(t) => (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.not.updated", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        complete({
+          db.run(NodesTQ.getLastHeartbeat(compositeId).update(Some(ApiTime.nowUTC)).asTry).map({
+            case Success(v) =>
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                logger.debug(s"POST /orgs/$orgid/users/$id/heartbeat result: $v")
+                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.updated")))
+              } else {
+                (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
+              }
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.not.updated", compositeId, t.toString))
+            case Failure(t) => (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.not.updated", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/nodes/{id}/errors ================================ */
@@ -1215,16 +1263,20 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/error")
   def nodeGetErrorsRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "errors") & get) { (orgid, id) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(NodeErrorTQ.getNodeError(compositeId).result).map({ list =>
-          logger.debug("GET /orgs/"+orgid+"/nodes/"+id+"/errors result size: "+list.size)
-          if (list.nonEmpty) (HttpCode.OK, list.head.toNodeError)
-          else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.READ) { _ =>
+        complete({
+          db.run(NodeErrorTQ.getNodeError(compositeId).result).map({ list =>
+            logger.debug("GET /orgs/" + orgid + "/nodes/" + id + "/errors result size: " + list.size)
+            if (list.nonEmpty) (HttpCode.OK, list.head.toNodeError)
+            else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== PUT /orgs/{orgid}/nodes/{id}/errors ===============================
@@ -1294,30 +1346,34 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/error")
   def nodePutErrorsRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "errors") & put & entity(as[PutNodeErrorRequest])) { (orgid, id, reqBody) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          db.run(reqBody.toNodeErrorRow(compositeId).upsert.asTry.flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/errors result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEERRORS, ResChangeOperation.CREATEDMODIFIED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
-              (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.errors.added")))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.errors.not.inserted", compositeId, t.getMessage)))
-              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.errors.not.inserted", compositeId, t.toString))
-            case Failure(t) =>
-              if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.errors.not.inserted", compositeId, t.getMessage)))
-              else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.errors.not.inserted", compositeId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            db.run(reqBody.toNodeErrorRow(compositeId).upsert.asTry.flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/errors result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEERRORS, ResChangeOperation.CREATEDMODIFIED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
+                (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.errors.added")))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.errors.not.inserted", compositeId, t.getMessage)))
+                else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.errors.not.inserted", compositeId, t.toString))
+              case Failure(t) =>
+                if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.errors.not.inserted", compositeId, t.getMessage)))
+                else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.errors.not.inserted", compositeId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/nodes/{id}/errors ===============================
@@ -1334,32 +1390,36 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/error")
   def nodeDeleteErrorsRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "errors") & delete) { (orgid, id) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.WRITE) { _ =>
-      complete({
-        db.run(NodeErrorTQ.getNodeError(compositeId).delete.asTry.flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("DELETE /orgs/" + orgid + "/nodes/" + id + "/errors result: " + v)
-            if (v > 0) {
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEERRORS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) => // there were no db errors, but determine if it actually found it or not
-            logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.errors.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.errors.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.errors.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        complete({
+          db.run(NodeErrorTQ.getNodeError(compositeId).delete.asTry.flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("DELETE /orgs/" + orgid + "/nodes/" + id + "/errors result: " + v)
+              if (v > 0) {
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEERRORS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) => // there were no db errors, but determine if it actually found it or not
+              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.errors.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.errors.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.errors.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/nodes/{id}/status ================================ */
@@ -1408,16 +1468,20 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/status")
   def nodeGetStatusRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "status") & get) { (orgid, id) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(NodeStatusTQ.getNodeStatus(compositeId).result).map({ list =>
-          logger.debug("GET /orgs/"+orgid+"/nodes/"+id+"/status result size: "+list.size)
-          if (list.nonEmpty) (HttpCode.OK, list.head.toNodeStatus)
-          else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.READ) { _ =>
+        complete({
+          db.run(NodeStatusTQ.getNodeStatus(compositeId).result).map({ list =>
+            logger.debug("GET /orgs/" + orgid + "/nodes/" + id + "/status result size: " + list.size)
+            if (list.nonEmpty) (HttpCode.OK, list.head.toNodeStatus)
+            else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== PUT /orgs/{orgid}/nodes/{id}/status ===============================
@@ -1500,30 +1564,34 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/status")
   def nodePutStatusRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "status") & put & entity(as[PutNodeStatusRequest])) { (orgid, id, reqBody) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          db.run(reqBody.toNodeStatusRow(compositeId).upsert.asTry.flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/status result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODESTATUS, ResChangeOperation.CREATEDMODIFIED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
-              (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("status.added.or.updated")))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.status.not.inserted.or.updated", compositeId, t.getMessage)))
-              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.status.not.inserted.or.updated", compositeId, t.toString))
-            case Failure(t) =>
-              if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.status.not.inserted.or.updated", compositeId, t.getMessage)))
-              else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.status.not.inserted.or.updated", compositeId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            db.run(reqBody.toNodeStatusRow(compositeId).upsert.asTry.flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/status result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODESTATUS, ResChangeOperation.CREATEDMODIFIED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
+                (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("status.added.or.updated")))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.status.not.inserted.or.updated", compositeId, t.getMessage)))
+                else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.status.not.inserted.or.updated", compositeId, t.toString))
+              case Failure(t) =>
+                if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.status.not.inserted.or.updated", compositeId, t.getMessage)))
+                else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.status.not.inserted.or.updated", compositeId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/nodes/{id}/status ===============================
@@ -1540,32 +1608,36 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/status")
   def nodeDeleteStatusRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "status") & delete) { (orgid, id) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.WRITE) { _ =>
-      complete({
-        db.run(NodeStatusTQ.getNodeStatus(compositeId).delete.asTry.flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("DELETE /orgs/" + orgid + "/nodes/" + id + "/status result: " + v)
-            if (v > 0) {
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODESTATUS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.status.not.found", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) => // there were no db status, but determine if it actually found it or not
-            logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.status.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.status.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.status.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        complete({
+          db.run(NodeStatusTQ.getNodeStatus(compositeId).delete.asTry.flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("DELETE /orgs/" + orgid + "/nodes/" + id + "/status result: " + v)
+              if (v > 0) {
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODESTATUS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.status.not.found", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) => // there were no db status, but determine if it actually found it or not
+              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource status table: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.status.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.status.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.status.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/nodes/{id}/policy ================================ */
@@ -1584,16 +1656,20 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/policy")
   def nodeGetPolicyRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "policy") & get) { (orgid, id) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(NodePolicyTQ.getNodePolicy(compositeId).result).map({ list =>
-          logger.debug("GET /orgs/"+orgid+"/nodes/"+id+"/policy result size: "+list.size)
-          if (list.nonEmpty) (HttpCode.OK, list.head.toNodePolicy)
-          else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.READ) { _ =>
+        complete({
+          db.run(NodePolicyTQ.getNodePolicy(compositeId).result).map({ list =>
+            logger.debug("GET /orgs/" + orgid + "/nodes/" + id + "/policy result size: " + list.size)
+            if (list.nonEmpty) (HttpCode.OK, list.head.toNodePolicy)
+            else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== PUT /orgs/{orgid}/nodes/{id}/policy ===============================
@@ -1667,53 +1743,57 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/policy")
   def nodePutPolicyRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "policy") & put & parameter((Symbol("noheartbeat").?)) & entity(as[PutNodePolicyRequest])) { (orgid, id, noheartbeat, reqBody) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem(noheartbeat)) {
-        complete({
-          val noHB = if (noheartbeat.isEmpty) false else if (noheartbeat.get.toLowerCase == "true") true else false
-          db.run(reqBody.toNodePolicyRow(compositeId).upsert.asTry.flatMap({
-            case Success(v) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/policy result: " + v)
-              NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          }).flatMap({
-            case Success(v) =>
-              logger.debug("Update /orgs/" + orgid + "/nodes/" + id + " lastUpdated result: " + v)
-              if (noHB) DBIO.successful(1).asTry  // skip updating lastHeartbeat
-              else NodesTQ.setLastHeartbeat(compositeId, ApiTime.nowUTC).asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          }).flatMap({
-            case Success(n) =>
-              // Add the resource to the resourcechanges table
-              if (!noHB) logger.debug("Update /orgs/" + orgid + "/nodes/" + id + " lastHeartbeat result: " + n)
-              try {
-                val numUpdated: Int = n.toString.toInt // i think n is an AnyRef so we have to do this to get it to an int
-                if (numUpdated > 0) {
-                  ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEPOLICIES, ResChangeOperation.CREATEDMODIFIED).insert.asTry
-                } else {
-                  DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId))).asTry
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem(noheartbeat)) {
+          complete({
+            val noHB = if (noheartbeat.isEmpty) false else if (noheartbeat.get.toLowerCase == "true") true else false
+            db.run(reqBody.toNodePolicyRow(compositeId).upsert.asTry.flatMap({
+              case Success(v) =>
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/policy result: " + v)
+                NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            }).flatMap({
+              case Success(v) =>
+                logger.debug("Update /orgs/" + orgid + "/nodes/" + id + " lastUpdated result: " + v)
+                if (noHB) DBIO.successful(1).asTry // skip updating lastHeartbeat
+                else NodesTQ.setLastHeartbeat(compositeId, ApiTime.nowUTC).asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            }).flatMap({
+              case Success(n) =>
+                // Add the resource to the resourcechanges table
+                if (!noHB) logger.debug("Update /orgs/" + orgid + "/nodes/" + id + " lastHeartbeat result: " + n)
+                try {
+                  val numUpdated: Int = n.toString.toInt // i think n is an AnyRef so we have to do this to get it to an int
+                  if (numUpdated > 0) {
+                    ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEPOLICIES, ResChangeOperation.CREATEDMODIFIED).insert.asTry
+                  } else {
+                    DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId))).asTry
+                  }
+                } catch {
+                  case e: Exception => DBIO.failed(new DBProcessingError(HttpCode.INTERNAL_ERROR, ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.policy.not.updated", compositeId, e))).asTry
                 }
-              } catch {
-                case e: Exception => DBIO.failed(new DBProcessingError(HttpCode.INTERNAL_ERROR, ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.policy.not.updated", compositeId, e))).asTry
-              }
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/policy updating resource status table: " + v)
-              (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.policy.added.or.updated")))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.policy.not.inserted.or.updated", compositeId, t.getMessage)))
-              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.policy.not.inserted.or.updated", compositeId, t.toString))
-            case Failure(t) =>
-              if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.policy.not.inserted.or.updated", compositeId, t.getMessage)))
-              else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.policy.not.inserted.or.updated", compositeId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/policy updating resource status table: " + v)
+                (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.policy.added.or.updated")))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.policy.not.inserted.or.updated", compositeId, t.getMessage)))
+                else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.policy.not.inserted.or.updated", compositeId, t.toString))
+              case Failure(t) =>
+                if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("node.policy.not.inserted.or.updated", compositeId, t.getMessage)))
+                else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.policy.not.inserted.or.updated", compositeId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/nodes/{id}/policy ===============================
@@ -1730,37 +1810,41 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/policy")
   def nodeDeletePolicyRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "policy") & delete) { (orgid, id) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.WRITE) { _ =>
-      complete({
-        db.run(NodePolicyTQ.getNodePolicy(compositeId).delete.asTry.flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("DELETE /orgs/" + orgid + "/nodes/" + id + "/policy result: " + v)
-            if (v > 0) {
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEPOLICIES, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.policy.not.found", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) =>
-            logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource policy table: " + v)
-            NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
-          case Failure(t) => DBIO.failed(new Throwable(t.getMessage)).asTry
-        })).map({
-          case Success(v) => // there were no db policy, but determine if it actually found it or not
-            logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " lastUpdated field updated: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.policy.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.policy.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.policy.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        complete({
+          db.run(NodePolicyTQ.getNodePolicy(compositeId).delete.asTry.flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("DELETE /orgs/" + orgid + "/nodes/" + id + "/policy result: " + v)
+              if (v > 0) {
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEPOLICIES, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.policy.not.found", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) =>
+              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " updating resource policy table: " + v)
+              NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
+            case Failure(t) => DBIO.failed(new Throwable(t.getMessage)).asTry
+          })).map({
+            case Success(v) => // there were no db policy, but determine if it actually found it or not
+              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + " lastUpdated field updated: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.policy.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.policy.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.policy.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/nodes/{id}/agreements ================================ */
@@ -1808,6 +1892,7 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/agreement")
   def nodeGetAgreementsRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "agreements") & get) { (orgid, id) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
     exchAuth(TNode(compositeId),Access.READ) { _ =>
       complete({
@@ -1865,6 +1950,7 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/agreement")
   def nodeGetAgreementRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "agreements" / Segment) & get) { (orgid, id, agrId) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
     exchAuth(TNode(compositeId),Access.READ) { _ =>
       complete({
@@ -1955,59 +2041,63 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/agreement")
   def nodePutAgreementRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "agreements" / Segment) & put & parameter((Symbol("noheartbeat").?)) & entity(as[PutNodeAgreementRequest])) { (orgid, id, agrId, noheartbeat, reqBody) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem(noheartbeat)) {
-        complete({
-          val noHB = if (noheartbeat.isEmpty) false else if (noheartbeat.get.toLowerCase == "true") true else false
-          val maxAgreements: Int = ExchConfig.getInt("api.limits.maxAgreements")
-          val getNumOwnedDbio = if (maxAgreements == 0) DBIO.successful(0) else NodeAgreementsTQ.getNumOwned(compositeId).result // avoid DB read for this if there is no max
-          db.run(getNumOwnedDbio.flatMap({ xs =>
-            if (maxAgreements != 0) logger.debug("PUT /orgs/"+orgid+"/nodes/"+id+"/agreements/"+agrId+" num owned: "+xs)
-            val numOwned: Int = xs
-            // we are not sure if this is create or update, but if they are already over the limit, stop them anyway
-            if (maxAgreements == 0 || numOwned <= maxAgreements) reqBody.toNodeAgreementRow(compositeId, agrId).upsert.asTry
-            else DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.limit.of.agreements.for.node", maxAgreements) )).asTry
-          }).flatMap({
-            case Success(v) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/agreements/" + agrId + " result: " + v)
-              NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          }).flatMap({
-            case Success(v) =>
-              logger.debug("Update /orgs/" + orgid + "/nodes/" + id + " lastUpdated result: " + v)
-              if (noHB) DBIO.successful(1).asTry  // skip updating lastHeartbeat
-              else NodesTQ.setLastHeartbeat(compositeId, ApiTime.nowUTC).asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          }).flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              if (!noHB) logger.debug("Update /orgs/" + orgid + "/nodes/" + id + " lastHeartbeat result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEAGREEMENTS, ResChangeOperation.CREATEDMODIFIED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(n) =>
-              logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/agreements/" + agrId + " updated in changes table: " + n)
-              try {
-                val numUpdated: Int = n.toString.toInt // i think n is an AnyRef so we have to do this to get it to an int
-                if (numUpdated > 0) {
-                  (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.agreement.added.or.updated")))
-                } else {
-                  (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
-                }
-              } catch {
-                case e: Exception => (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.agreement.not.updated", compositeId, e)))
-              } // the specific exception is NumberFormatException
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.agreement.not.inserted.or.updated", agrId, compositeId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.agreement.not.inserted.or.updated", agrId, compositeId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem(noheartbeat)) {
+          complete({
+            val noHB = if (noheartbeat.isEmpty) false else if (noheartbeat.get.toLowerCase == "true") true else false
+            val maxAgreements: Int = ExchConfig.getInt("api.limits.maxAgreements")
+            val getNumOwnedDbio = if (maxAgreements == 0) DBIO.successful(0) else NodeAgreementsTQ.getNumOwned(compositeId).result // avoid DB read for this if there is no max
+            db.run(getNumOwnedDbio.flatMap({ xs =>
+              if (maxAgreements != 0) logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/agreements/" + agrId + " num owned: " + xs)
+              val numOwned: Int = xs
+              // we are not sure if this is create or update, but if they are already over the limit, stop them anyway
+              if (maxAgreements == 0 || numOwned <= maxAgreements) reqBody.toNodeAgreementRow(compositeId, agrId).upsert.asTry
+              else DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.limit.of.agreements.for.node", maxAgreements))).asTry
+            }).flatMap({
+              case Success(v) =>
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/agreements/" + agrId + " result: " + v)
+                NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            }).flatMap({
+              case Success(v) =>
+                logger.debug("Update /orgs/" + orgid + "/nodes/" + id + " lastUpdated result: " + v)
+                if (noHB) DBIO.successful(1).asTry // skip updating lastHeartbeat
+                else NodesTQ.setLastHeartbeat(compositeId, ApiTime.nowUTC).asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            }).flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                if (!noHB) logger.debug("Update /orgs/" + orgid + "/nodes/" + id + " lastHeartbeat result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEAGREEMENTS, ResChangeOperation.CREATEDMODIFIED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(n) =>
+                logger.debug("PUT /orgs/" + orgid + "/nodes/" + id + "/agreements/" + agrId + " updated in changes table: " + n)
+                try {
+                  val numUpdated: Int = n.toString.toInt // i think n is an AnyRef so we have to do this to get it to an int
+                  if (numUpdated > 0) {
+                    (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.agreement.added.or.updated")))
+                  } else {
+                    (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.not.found", compositeId)))
+                  }
+                } catch {
+                  case e: Exception => (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.agreement.not.updated", compositeId, e)))
+                } // the specific exception is NumberFormatException
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.agreement.not.inserted.or.updated", agrId, compositeId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.agreement.not.inserted.or.updated", agrId, compositeId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/nodes/{id}/agreements ===============================
@@ -2024,38 +2114,42 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/agreement")
   def nodeDeleteAgreementsRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "agreements") & delete) { (orgid, id) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.WRITE) { _ =>
-      complete({
-        // remove does *not* throw an exception if the key does not exist
-        db.run(NodeAgreementsTQ.getAgreements(compositeId).delete.asTry.flatMap({
-          case Success(v) =>
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              // Add the resource to the resourcechanges table
-              logger.debug("DELETE /nodes/" + id + "/agreements result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEAGREEMENTS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("no.node.agreements.found", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) =>
-            logger.debug("DELETE /nodes/" + id + "/agreements updated in changes table: " + v)
-            NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("DELETE /nodes/" + id + "/agreements lastUpdated field updated: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.agreements.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.agreements.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.agreements.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        complete({
+          // remove does *not* throw an exception if the key does not exist
+          db.run(NodeAgreementsTQ.getAgreements(compositeId).delete.asTry.flatMap({
+            case Success(v) =>
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                // Add the resource to the resourcechanges table
+                logger.debug("DELETE /nodes/" + id + "/agreements result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEAGREEMENTS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("no.node.agreements.found", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) =>
+              logger.debug("DELETE /nodes/" + id + "/agreements updated in changes table: " + v)
+              NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("DELETE /nodes/" + id + "/agreements lastUpdated field updated: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.agreements.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.agreements.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.agreements.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/nodes/{id}/agreements/{agid} ===============================
@@ -2073,37 +2167,41 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/agreement")
   def nodeDeleteAgreementRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "agreements" / Segment) & delete) { (orgid, id, agrId) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.WRITE) { _ =>
-      complete({
-        db.run(NodeAgreementsTQ.getAgreement(compositeId,agrId).delete.asTry.flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("DELETE /nodes/" + id + "/agreements/" + agrId + " result: " + v)
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEAGREEMENTS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.agreement.not.found", agrId, compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) =>
-            logger.debug("DELETE /nodes/" + id + "/agreements/" + agrId + " updated in changes table: " + v)
-            NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("DELETE /nodes/" + id + "/agreements/" + agrId + " lastUpdated field updated: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.agreement.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.agreement.not.deleted", agrId, compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.agreement.not.deleted", agrId, compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        complete({
+          db.run(NodeAgreementsTQ.getAgreement(compositeId, agrId).delete.asTry.flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("DELETE /nodes/" + id + "/agreements/" + agrId + " result: " + v)
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEAGREEMENTS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("node.agreement.not.found", agrId, compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) =>
+              logger.debug("DELETE /nodes/" + id + "/agreements/" + agrId + " updated in changes table: " + v)
+              NodesTQ.setLastUpdated(compositeId, ApiTime.nowUTC).asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("DELETE /nodes/" + id + "/agreements/" + agrId + " lastUpdated field updated: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.agreement.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.agreement.not.deleted", agrId, compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.agreement.not.deleted", agrId, compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/nodes/{id}/msgs ===============================
@@ -2166,50 +2264,54 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/message")
   def nodePostMsgRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "msgs") & post & entity(as[PostNodesMsgsRequest])) { (orgid, id, reqBody) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.SEND_MSG_TO_NODE) { ident =>
-      complete({
-        val agbotId: String = ident.creds.id      //someday: handle the case where the acls allow users to send msgs
-        var msgNum = ""
-        val maxMessagesInMailbox: Int = ExchConfig.getInt("api.limits.maxMessagesInMailbox")
-        val getNumOwnedDbio = if (maxMessagesInMailbox == 0) DBIO.successful(0) else NodeMsgsTQ.getNumOwned(compositeId).result // avoid DB read for this if there is no max
-        // Remove msgs whose TTL is past, then check the mailbox is not full, then get the agbot publicKey, then write the nodemsgs row, all in the same db.run thread
-        db.run(getNumOwnedDbio.flatMap({ xs =>
-          if (maxMessagesInMailbox != 0) logger.debug("POST /orgs/"+orgid+"/nodes/"+id+"/msgs mailbox size: "+xs)
-          val mailboxSize: Int = xs
-          if (maxMessagesInMailbox == 0 || mailboxSize < maxMessagesInMailbox) AgbotsTQ.getPublicKey(agbotId).result.asTry
-          else DBIO.failed(new DBProcessingError(HttpCode.BAD_GW, ApiRespType.BAD_GW, ExchMsg.translate("node.mailbox.full", compositeId, maxMessagesInMailbox) )).asTry
-        }).flatMap({
-          case Success(v) =>
-            logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/msgs agbot publickey result: " + v)
-            if (v.nonEmpty) { // it seems this returns success even when the agbot is not found
-              val agbotPubKey: String = v.head
-              if (agbotPubKey != "") NodeMsgRow(0, compositeId, agbotId, agbotPubKey, reqBody.message, ApiTime.nowUTC, ApiTime.futureUTC(reqBody.ttl)).insert.asTry
-              else DBIO.failed(new DBProcessingError(HttpCode.BAD_INPUT, ApiRespType.BAD_INPUT, ExchMsg.translate("message.sender.public.key.not.in.exchange"))).asTry
-            }
-            else DBIO.failed(new DBProcessingError(HttpCode.BAD_INPUT, ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.agbot.not.found", agbotId))).asTry
-          case Failure(t) => DBIO.failed(t).asTry // rethrow the error to the next step
-        }).flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("DELETE /orgs/" + orgid + "/nodes/" + id + "/msgs write row result: " + v)
-            msgNum = v.toString
-            ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEMSGS, ResChangeOperation.CREATED).insert.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/msgs update changes table : " + v)
-            (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.msg.inserted", msgNum)))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            if (ExchangePosgtresErrorHandling.isKeyNotFoundError(t)) (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.msg.nodeid.not.found", compositeId, t.getMessage)))
-            else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.msg.not.inserted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.msg.not.inserted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.SEND_MSG_TO_NODE) { ident =>
+        complete({
+          val agbotId: String = ident.creds.id //someday: handle the case where the acls allow users to send msgs
+          var msgNum = ""
+          val maxMessagesInMailbox: Int = ExchConfig.getInt("api.limits.maxMessagesInMailbox")
+          val getNumOwnedDbio = if (maxMessagesInMailbox == 0) DBIO.successful(0) else NodeMsgsTQ.getNumOwned(compositeId).result // avoid DB read for this if there is no max
+          // Remove msgs whose TTL is past, then check the mailbox is not full, then get the agbot publicKey, then write the nodemsgs row, all in the same db.run thread
+          db.run(getNumOwnedDbio.flatMap({ xs =>
+            if (maxMessagesInMailbox != 0) logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/msgs mailbox size: " + xs)
+            val mailboxSize: Int = xs
+            if (maxMessagesInMailbox == 0 || mailboxSize < maxMessagesInMailbox) AgbotsTQ.getPublicKey(agbotId).result.asTry
+            else DBIO.failed(new DBProcessingError(HttpCode.BAD_GW, ApiRespType.BAD_GW, ExchMsg.translate("node.mailbox.full", compositeId, maxMessagesInMailbox))).asTry
+          }).flatMap({
+            case Success(v) =>
+              logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/msgs agbot publickey result: " + v)
+              if (v.nonEmpty) { // it seems this returns success even when the agbot is not found
+                val agbotPubKey: String = v.head
+                if (agbotPubKey != "") NodeMsgRow(0, compositeId, agbotId, agbotPubKey, reqBody.message, ApiTime.nowUTC, ApiTime.futureUTC(reqBody.ttl)).insert.asTry
+                else DBIO.failed(new DBProcessingError(HttpCode.BAD_INPUT, ApiRespType.BAD_INPUT, ExchMsg.translate("message.sender.public.key.not.in.exchange"))).asTry
+              }
+              else DBIO.failed(new DBProcessingError(HttpCode.BAD_INPUT, ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.agbot.not.found", agbotId))).asTry
+            case Failure(t) => DBIO.failed(t).asTry // rethrow the error to the next step
+          }).flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("DELETE /orgs/" + orgid + "/nodes/" + id + "/msgs write row result: " + v)
+              msgNum = v.toString
+              ResourceChange(0L, orgid, id, ResChangeCategory.NODE, false, ResChangeResource.NODEMSGS, ResChangeOperation.CREATED).insert.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("POST /orgs/" + orgid + "/nodes/" + id + "/msgs update changes table : " + v)
+              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.msg.inserted", msgNum)))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              if (ExchangePosgtresErrorHandling.isKeyNotFoundError(t)) (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.msg.nodeid.not.found", compositeId, t.getMessage)))
+              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.msg.not.inserted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.msg.not.inserted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/nodes/{id}/msgs ================================ */
@@ -2230,25 +2332,29 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/message")
   def nodeGetMsgsRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "msgs") & get & parameter((Symbol("maxmsgs").?))) { (orgid, id, maxmsgsStrOpt) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId),Access.READ) { _ =>
-      validate(Try(maxmsgsStrOpt.map(_.toInt)).isSuccess, ExchMsg.translate("invalid.int.for.name", maxmsgsStrOpt.getOrElse(""), "maxmsgs")) {
-        complete({
-          // Set the query, including maxmsgs
-          var maxIntOpt = maxmsgsStrOpt.map(_.toInt)
-          var query = NodeMsgsTQ.getMsgs(compositeId).sortBy(_.msgId)
-          if (maxIntOpt.getOrElse(0) > 0) query = query.take(maxIntOpt.get)
-          // Get the msgs for this agbot
-          db.run(query.result).map({ list =>
-            logger.debug("GET /orgs/"+orgid+"/nodes/"+id+"/msgs result size: "+list.size)
-            //logger.debug("GET /orgs/"+orgid+"/nodes/"+id+"/msgs result: "+list.toString)
-            val msgs: List[NodeMsg] = list.map(_.toNodeMsg).toList
-            val code: StatusCode with Serializable = if (msgs.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-            (code, GetNodeMsgsResponse(msgs, 0))
-          })
-        }) // end of complete
-      }
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.READ) { _ =>
+        validate(Try(maxmsgsStrOpt.map(_.toInt)).isSuccess, ExchMsg.translate("invalid.int.for.name", maxmsgsStrOpt.getOrElse(""), "maxmsgs")) {
+          complete({
+            // Set the query, including maxmsgs
+            var maxIntOpt = maxmsgsStrOpt.map(_.toInt)
+            var query = NodeMsgsTQ.getMsgs(compositeId).sortBy(_.msgId)
+            if (maxIntOpt.getOrElse(0) > 0) query = query.take(maxIntOpt.get)
+            // Get the msgs for this agbot
+            db.run(query.result).map({ list =>
+              logger.debug("GET /orgs/" + orgid + "/nodes/" + id + "/msgs result size: " + list.size)
+              //logger.debug("GET /orgs/"+orgid+"/nodes/"+id+"/msgs result: "+list.toString)
+              val msgs: List[NodeMsg] = list.map(_.toNodeMsg).toList
+              val code: StatusCode with Serializable = if (msgs.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+              (code, GetNodeMsgsResponse(msgs, 0))
+            })
+          }) // end of complete
+        }
+      } // end of exchAuth
+    }
   }
   
   /* ====== GET /orgs/{orgid}/nodes/{id}/msgs/{msgid} ================================ */
@@ -2282,39 +2388,42 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/message")
   def nodeGetMsgRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "msgs" / Segment) & get) {
     (orgid, id, msgid) =>
-      val compositeId: String = OrgAndId(orgid, id).toString
       
-      exchAuth(TNode(compositeId),Access.READ) {
-        _ =>
-          complete({
-            db.run(
-              NodeMsgsTQ.getMsg(nodeId = compositeId,
-                                msgId = msgid.toInt)
-                        .result
-                        .map(
-                          result =>
-                            GetNodeMsgsResponse(lastIndex = 0,
-                                                messages = result.map(
-                                                             message =>
-                                                               NodeMsg(agbotId = message.agbotId,
-                                                                       agbotPubKey = message.agbotPubKey,
-                                                                       message = message.message,
-                                                                       msgId = message.msgId,
-                                                                       timeExpires = message.timeExpires,
-                                                                       timeSent = message.timeSent)).toList))
-                        .asTry
+      val compositeId: String = OrgAndId(orgid, id).toString
+      selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+        implicit val acceptLang: Language = lang
+        exchAuth(TNode(compositeId), Access.READ) {
+          _ =>
+            complete({
+              db.run(
+                NodeMsgsTQ.getMsg(nodeId = compositeId,
+                  msgId = msgid.toInt)
+                  .result
+                  .map(
+                    result =>
+                      GetNodeMsgsResponse(lastIndex = 0,
+                        messages = result.map(
+                          message =>
+                            NodeMsg(agbotId = message.agbotId,
+                              agbotPubKey = message.agbotPubKey,
+                              message = message.message,
+                              msgId = message.msgId,
+                              timeExpires = message.timeExpires,
+                              timeSent = message.timeSent)).toList))
+                  .asTry
               )
-              .map({
-              case Success(message) =>
-                if(message.messages.nonEmpty)
-                  (HttpCode.OK, message)
-                else
-                  (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
-              case Failure(t) =>
-                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.message", t.getMessage)))
-            })
-          }) // end of complete
-      } // end of exchAuth
+                .map({
+                  case Success(message) =>
+                    if (message.messages.nonEmpty)
+                      (HttpCode.OK, message)
+                    else
+                      (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
+                  case Failure(t) =>
+                    (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.message", t.getMessage)))
+                })
+            }) // end of complete
+        } // end of exchAuth
+      }
   }
 
   // =========== DELETE /orgs/{orgid}/nodes/{id}/msgs/{msgid} ===============================
@@ -2332,25 +2441,31 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node/message")
   def nodeDeleteMsgRoute: Route = (path("orgs" / Segment / "nodes" / Segment / "msgs" / Segment) & delete) { (orgid, id, msgIdStr) =>
+    
     val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TNode(compositeId), Access.WRITE) { _ =>
-      complete({
-        try {
-          val msgId: Int = msgIdStr.toInt   // this can throw an exception, that's why this whole section is in a try/catch
-          db.run(NodeMsgsTQ.getMsg(compositeId,msgId).delete.asTry).map({
-            case Success(v) =>
-              logger.debug("DELETE /nodes/" + id + "/msgs/" + msgId + " updated in changes table: " + v)
-              (HttpCode.DELETED,  ApiResponse(ApiRespType.OK, ExchMsg.translate("node.msg.deleted")))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.msg.not.deleted", msgId, compositeId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.msg.not.deleted", msgId, compositeId, t.toString)))
-          })
-        } catch { case e: Exception => (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("msgid.must.be.int", e))) }    // the specific exception is NumberFormatException
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TNode(compositeId), Access.WRITE) { _ =>
+        complete({
+          try {
+            val msgId: Int = msgIdStr.toInt // this can throw an exception, that's why this whole section is in a try/catch
+            db.run(NodeMsgsTQ.getMsg(compositeId, msgId).delete.asTry).map({
+              case Success(v) =>
+                logger.debug("DELETE /nodes/" + id + "/msgs/" + msgId + " updated in changes table: " + v)
+                (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("node.msg.deleted")))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("node.msg.not.deleted", msgId, compositeId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("node.msg.not.deleted", msgId, compositeId, t.toString)))
+            })
+          } catch {
+            case e: Exception => (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("msgid.must.be.int", e)))
+          } // the specific exception is NumberFormatException
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
   
   // ====== GET /orgs/{orgid}/node-details ===================================
@@ -2506,198 +2621,202 @@ trait NodesRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "node")
   def nodesGetDetails: Route =
     (path("orgs" / Segment / "node-details") & get & parameter((Symbol("arch").?, Symbol("id").?, Symbol("name").?, Symbol("type").?, Symbol("owner").?))) {
-      (orgid: String, arch: Option[String], id: Option[String], name: Option[String], nodeType: Option[String], owner: Option[String]) =>
-        exchAuth(TNode(OrgAndId(orgid,"#").toString), Access.READ) {
-          ident =>
-            validateWithMsg(GetNodesUtils.getNodesProblem(nodeType)) {
-              complete({
-                implicit val jsonFormats: Formats = DefaultFormats
-                val ownerFilter: Option[String] =
-                  if(ident.isAdmin ||
-                     ident.isSuperUser ||
-                     ident.role.equals(AuthRoles.Agbot))
-                    owner
-                  else
-                    Some(ident.identityString)
-                
-                val getNodes =
-                  for {
-                    nodes <- NodesTQ.rows
-                                   .filterOpt(arch)((node, arch) => node.arch like arch)
-                                   .filterOpt(id)((node, id) => node.id like id)
-                                   .filterOpt(name)((node, name) => node.name like name)
-                                   .filterOpt(nodeType)(
-                                     (node, nodeType) => {
-                                       node.nodeType === nodeType.toLowerCase ||
-                                        node.nodeType === nodeType.toLowerCase.replace("device", "")
-                                     }) // "" === ""
-                                   .filter(_.orgid === orgid)
-                                   .filterOpt(ownerFilter)((node, ownerFilter) => node.owner like ownerFilter)
-                                   .joinLeft(NodeErrorTQ.rows.filterOpt(id)((nodeErrors, id) => nodeErrors.nodeId like id))
-                                     .on(_.id === _.nodeId)
-                                   .joinLeft(NodePolicyTQ.rows.filterOpt(id)((nodePolicy, id) => nodePolicy.nodeId like id))
-                                     .on(_._1.id === _.nodeId)
-                                   .joinLeft(NodeStatusTQ.rows.filterOpt(id)((nodeStatuses, id) => nodeStatuses.nodeId like id))
-                                     .on(_._1._1.id === _.nodeId) // node.id === nodeStatus.nodeid
-                                   .sortBy(_._1._1._1.id.asc)     // node.id ASC
-                                   // (((Nodes, Node Errors), Node Policy), Node Statuses)
-                                   // Flatten the tupled structure, lexically sort columns.
-                                   .map(
-                                     node =>
-                                       (node._1._1._1.arch,
-                                         node._1._1._1.id,
-                                         node._1._1._1.heartbeatIntervals,
-                                         node._1._1._1.lastHeartbeat,
-                                         node._1._1._1.lastUpdated,
-                                         node._1._1._1.msgEndPoint,
-                                         node._1._1._1.name,
-                                         node._1._1._1.nodeType,
-                                         node._1._1._1.orgid,
-                                         node._1._1._1.owner,
-                                         node._1._1._1.pattern,
-                                         node._1._1._1.publicKey,
-                                         node._1._1._1.regServices,
-                                         node._1._1._1.softwareVersions,
-                                         (if(ident.isAdmin ||
-                                             ident.isSuperUser) // Do not pull nor query the Node's token if (Super)Admin.
-                                           node._1._1._1.id.substring(0,0) // node.id -> ""
-                                         else
-                                           node._1._1._1.token),
-                                         node._1._1._1.userInput,
-                                         node._1._1._2,           // Node Errors (errors, lastUpdated)
-                                         node._1._2,              // Node Policy (constraints, lastUpdated, properties)
-                                         node._2))                // Node Statuses (connectivity, lastUpdated, runningServices, services)
-                                   .result
-                                   // Complete type conversion to something more usable.
-                                   .map(
-                                     results =>
-                                       results.map(
-                                         node =>
-                                           NodeDetails(arch =
-                                             if(node._1.isEmpty)
-                                               None
-                                             else
-                                               Some(node._1),
-                                             connectivity =
-                                               if(node._19.isEmpty ||
-                                                  node._19.get.connectivity.isEmpty)
-                                                 None
-                                               else
-                                                 Some(read[Map[String, Boolean]](node._19.get.connectivity)),
-                                             constraints =
-                                              if(node._18.isEmpty ||
-                                                 node._18.get.constraints.isEmpty)
-                                                None
-                                              else
-                                                Some(read[List[String]](node._18.get.constraints)),
-                                             errors =
-                                               if(node._17.isEmpty ||
-                                                  node._17.get.errors.isEmpty)
-                                                 None
-                                               else
-                                                 Some(read[List[Any]](node._17.get.errors)),
-                                             id = node._2,
-                                             heartbeatIntervals =
-                                               if(node._3.isEmpty)
-                                                 Some(NodeHeartbeatIntervals(0, 0, 0))
-                                               else
-                                                 Some(read[NodeHeartbeatIntervals](node._3)),
-                                             lastHeartbeat = node._4,
-                                             lastUpdatedNode = node._5,
-                                             lastUpdatedNodeError =
-                                               if(node._17.isDefined)
-                                                 Some(node._17.get.lastUpdated)
-                                               else
-                                                 None,
-                                             lastUpdatedNodePolicy =
-                                              if(node._18.isDefined)
-                                                Some(node._18.get.lastUpdated)
-                                              else
-                                                None,
-                                             lastUpdatedNodeStatus =
-                                               if(node._19.isDefined)
-                                                 Some(node._19.get.lastUpdated)
-                                               else
-                                                 None,
-                                             msgEndPoint =
-                                               if(node._6.isEmpty)
-                                                 None
-                                               else
-                                                 Some(node._6),
-                                             name =
-                                               if(node._7.isEmpty)
-                                                 None
-                                               else
-                                                 Some(node._7),
-                                             nodeType =
-                                               if(node._8.isEmpty)
-                                                 "device"
-                                               else
-                                                 node._8,
-                                             orgid = node._9,
-                                             owner = node._10,
-                                             pattern =
-                                               if(node._11.isEmpty)
-                                                 None
-                                               else
-                                                 Some(node._11),
-                                             properties =
-                                              if(node._18.isEmpty ||
-                                                 node._18.get.properties.isEmpty)
-                                                None
-                                              else
-                                                Some(read[List[OneProperty]](node._18.get.properties)),
-                                             publicKey =
-                                               if(node._12.isEmpty)
-                                                 None
-                                               else
-                                                 Some(node._12),
-                                             registeredServices =
-                                               if(node._13.isEmpty)
-                                                 None
-                                               else
-                                                 Some(read[List[RegService]](node._13).map(rs => RegService(rs.url, rs.numAgreements, rs.configState.orElse(Some("active")), rs.policy, rs.properties))),
-                                             runningServices =
-                                               if(node._19.isEmpty ||
-                                                  node._19.get.services.isEmpty)
-                                                 None
-                                               else
-                                                 Some(node._19.get.runningServices),
-                                             services =
-                                               if(node._19.isEmpty ||
-                                                  node._19.get.services.isEmpty)
-                                                 None
-                                               else
-                                                 Some(read[List[OneService]](node._19.get.services)),
-                                             softwareVersions =
-                                               if(node._14.isEmpty)
-                                                 None
-                                               else
-                                                 Some(read[Map[String, String]](node._14)),
-                                             token =
-                                               if(node._15.isEmpty)
-                                                 StrConstants.hiddenPw
-                                               else
-                                                 node._15,
-                                             userInput =
-                                               if(node._16.isEmpty)
-                                                 None
-                                               else
-                                                 Some(read[List[OneUserInputService]](node._16)))).toList)
-                    
-                  } yield(nodes)
-                
-                db.run(getNodes.asTry).map({
-                  case Success(nodes) =>
-                    if(nodes.nonEmpty)
-                      (HttpCode.OK, nodes)
-                    else
-                      (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
-                  case Failure(t) =>
-                    (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.message", t.getMessage)))
-                })
-              }) // end of complete
-            }
-        } // end of exchAuth
+
+        (orgid: String, arch: Option[String], id: Option[String], name: Option[String], nodeType: Option[String], owner: Option[String]) =>
+          selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+            implicit val acceptLang: Language = lang
+            exchAuth(TNode(OrgAndId(orgid, "#").toString), Access.READ) {
+              ident =>
+                validateWithMsg(GetNodesUtils.getNodesProblem(nodeType)) {
+                  complete({
+                    implicit val jsonFormats: Formats = DefaultFormats
+                    val ownerFilter: Option[String] =
+                      if (ident.isAdmin ||
+                        ident.isSuperUser ||
+                        ident.role.equals(AuthRoles.Agbot))
+                        owner
+                      else
+                        Some(ident.identityString)
+
+                    val getNodes =
+                      for {
+                        nodes <- NodesTQ.rows
+                          .filterOpt(arch)((node, arch) => node.arch like arch)
+                          .filterOpt(id)((node, id) => node.id like id)
+                          .filterOpt(name)((node, name) => node.name like name)
+                          .filterOpt(nodeType)(
+                            (node, nodeType) => {
+                              node.nodeType === nodeType.toLowerCase ||
+                                node.nodeType === nodeType.toLowerCase.replace("device", "")
+                            }) // "" === ""
+                          .filter(_.orgid === orgid)
+                          .filterOpt(ownerFilter)((node, ownerFilter) => node.owner like ownerFilter)
+                          .joinLeft(NodeErrorTQ.rows.filterOpt(id)((nodeErrors, id) => nodeErrors.nodeId like id))
+                          .on(_.id === _.nodeId)
+                          .joinLeft(NodePolicyTQ.rows.filterOpt(id)((nodePolicy, id) => nodePolicy.nodeId like id))
+                          .on(_._1.id === _.nodeId)
+                          .joinLeft(NodeStatusTQ.rows.filterOpt(id)((nodeStatuses, id) => nodeStatuses.nodeId like id))
+                          .on(_._1._1.id === _.nodeId) // node.id === nodeStatus.nodeid
+                          .sortBy(_._1._1._1.id.asc) // node.id ASC
+                          // (((Nodes, Node Errors), Node Policy), Node Statuses)
+                          // Flatten the tupled structure, lexically sort columns.
+                          .map(
+                            node =>
+                              (node._1._1._1.arch,
+                                node._1._1._1.id,
+                                node._1._1._1.heartbeatIntervals,
+                                node._1._1._1.lastHeartbeat,
+                                node._1._1._1.lastUpdated,
+                                node._1._1._1.msgEndPoint,
+                                node._1._1._1.name,
+                                node._1._1._1.nodeType,
+                                node._1._1._1.orgid,
+                                node._1._1._1.owner,
+                                node._1._1._1.pattern,
+                                node._1._1._1.publicKey,
+                                node._1._1._1.regServices,
+                                node._1._1._1.softwareVersions,
+                                (if (ident.isAdmin ||
+                                  ident.isSuperUser) // Do not pull nor query the Node's token if (Super)Admin.
+                                  node._1._1._1.id.substring(0, 0) // node.id -> ""
+                                else
+                                  node._1._1._1.token),
+                                node._1._1._1.userInput,
+                                node._1._1._2, // Node Errors (errors, lastUpdated)
+                                node._1._2, // Node Policy (constraints, lastUpdated, properties)
+                                node._2)) // Node Statuses (connectivity, lastUpdated, runningServices, services)
+                          .result
+                          // Complete type conversion to something more usable.
+                          .map(
+                            results =>
+                              results.map(
+                                node =>
+                                  NodeDetails(arch =
+                                    if (node._1.isEmpty)
+                                      None
+                                    else
+                                      Some(node._1),
+                                    connectivity =
+                                      if (node._19.isEmpty ||
+                                        node._19.get.connectivity.isEmpty)
+                                        None
+                                      else
+                                        Some(read[Map[String, Boolean]](node._19.get.connectivity)),
+                                    constraints =
+                                      if (node._18.isEmpty ||
+                                        node._18.get.constraints.isEmpty)
+                                        None
+                                      else
+                                        Some(read[List[String]](node._18.get.constraints)),
+                                    errors =
+                                      if (node._17.isEmpty ||
+                                        node._17.get.errors.isEmpty)
+                                        None
+                                      else
+                                        Some(read[List[Any]](node._17.get.errors)),
+                                    id = node._2,
+                                    heartbeatIntervals =
+                                      if (node._3.isEmpty)
+                                        Some(NodeHeartbeatIntervals(0, 0, 0))
+                                      else
+                                        Some(read[NodeHeartbeatIntervals](node._3)),
+                                    lastHeartbeat = node._4,
+                                    lastUpdatedNode = node._5,
+                                    lastUpdatedNodeError =
+                                      if (node._17.isDefined)
+                                        Some(node._17.get.lastUpdated)
+                                      else
+                                        None,
+                                    lastUpdatedNodePolicy =
+                                      if (node._18.isDefined)
+                                        Some(node._18.get.lastUpdated)
+                                      else
+                                        None,
+                                    lastUpdatedNodeStatus =
+                                      if (node._19.isDefined)
+                                        Some(node._19.get.lastUpdated)
+                                      else
+                                        None,
+                                    msgEndPoint =
+                                      if (node._6.isEmpty)
+                                        None
+                                      else
+                                        Some(node._6),
+                                    name =
+                                      if (node._7.isEmpty)
+                                        None
+                                      else
+                                        Some(node._7),
+                                    nodeType =
+                                      if (node._8.isEmpty)
+                                        "device"
+                                      else
+                                        node._8,
+                                    orgid = node._9,
+                                    owner = node._10,
+                                    pattern =
+                                      if (node._11.isEmpty)
+                                        None
+                                      else
+                                        Some(node._11),
+                                    properties =
+                                      if (node._18.isEmpty ||
+                                        node._18.get.properties.isEmpty)
+                                        None
+                                      else
+                                        Some(read[List[OneProperty]](node._18.get.properties)),
+                                    publicKey =
+                                      if (node._12.isEmpty)
+                                        None
+                                      else
+                                        Some(node._12),
+                                    registeredServices =
+                                      if (node._13.isEmpty)
+                                        None
+                                      else
+                                        Some(read[List[RegService]](node._13).map(rs => RegService(rs.url, rs.numAgreements, rs.configState.orElse(Some("active")), rs.policy, rs.properties))),
+                                    runningServices =
+                                      if (node._19.isEmpty ||
+                                        node._19.get.services.isEmpty)
+                                        None
+                                      else
+                                        Some(node._19.get.runningServices),
+                                    services =
+                                      if (node._19.isEmpty ||
+                                        node._19.get.services.isEmpty)
+                                        None
+                                      else
+                                        Some(read[List[OneService]](node._19.get.services)),
+                                    softwareVersions =
+                                      if (node._14.isEmpty)
+                                        None
+                                      else
+                                        Some(read[Map[String, String]](node._14)),
+                                    token =
+                                      if (node._15.isEmpty)
+                                        StrConstants.hiddenPw
+                                      else
+                                        node._15,
+                                    userInput =
+                                      if (node._16.isEmpty)
+                                        None
+                                      else
+                                        Some(read[List[OneUserInputService]](node._16)))).toList)
+
+                      } yield (nodes)
+
+                    db.run(getNodes.asTry).map({
+                      case Success(nodes) =>
+                        if (nodes.nonEmpty)
+                          (HttpCode.OK, nodes)
+                        else
+                          (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
+                      case Failure(t) =>
+                        (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.message", t.getMessage)))
+                    })
+                  }) // end of complete
+                }
+            } // end of exchAuth
+          }
     }
 }

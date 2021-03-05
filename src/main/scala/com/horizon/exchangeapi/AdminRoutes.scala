@@ -23,6 +23,7 @@ import io.swagger.v3.oas.annotations.tags.Tag
 import io.swagger.v3.oas.annotations._
 
 import scala.util._
+import akka.http.scaladsl.model.headers.Language
 
 /** Input body for POST /admin/hashpw */
 final case class AdminHashpwRequest(password: String) {
@@ -95,12 +96,15 @@ trait AdminRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied")))
   def adminReloadRoute: Route = (path("admin" / "reload") & post) {
     logger.debug("Doing POST /admin/reload")
-    exchAuth(TAction(), Access.ADMIN) { _ =>
-      complete({
-        ExchConfig.reload()
-        (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("reload.successful")))
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAction(), Access.ADMIN) { _ =>
+        complete({
+          ExchConfig.reload()
+          (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("reload.successful")))
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /admin/hashpw ===============================
@@ -190,12 +194,15 @@ trait AdminRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "401", description = "invalid credentials"),
       new responses.ApiResponse(responseCode = "403", description = "access denied")))
   def adminGetDbTokenRoute: Route = (path("admin" / "dropdb" / "token") & get) {
-    logger.debug("Doing GET /admin/dropdb/token")
-    exchAuth(TAction(), Access.ADMIN) { _ =>
-      complete({
-        (HttpCode.OK, AdminDropdbTokenResponse(createToken(Role.superUser)))
-      }) // end of complete
-    } // end of exchAuth
+    logger.debug("Doing GET /admin/dropdb/token") 
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAction(), Access.ADMIN) { _ =>
+        complete({
+          (HttpCode.OK, AdminDropdbTokenResponse(createToken(Role.superUser)))
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /admin/dropdb ===============================
@@ -209,20 +216,23 @@ trait AdminRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied")))
   def adminDropDbRoute: Route = (path("admin" / "dropdb") & post) {
     logger.debug("Doing POST /admin/dropdb")
-    exchAuth(TAction(), Access.ADMIN, hint = "token") { _ =>
-      complete({
-        db.run(ExchangeApiTables.dropDB.transactionally.asTry).map({
-          case Success(v) =>
-            logger.debug(s"POST /admin/dropdb result: $v")
-            AuthCache.clearAllCaches(includingIbmAuth=true)
-            (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("db.deleted")))
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("db.not.deleted", t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("db.not.deleted", t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAction(), Access.ADMIN, hint = "token") { _ =>
+        complete({
+          db.run(ExchangeApiTables.dropDB.transactionally.asTry).map({
+            case Success(v) =>
+              logger.debug(s"POST /admin/dropdb result: $v")
+              AuthCache.clearAllCaches(includingIbmAuth=true)
+              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("db.deleted")))
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("db.not.deleted", t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("db.not.deleted", t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /admin/initdb ===============================
@@ -236,21 +246,24 @@ trait AdminRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied")))
   def adminInitDbRoute: Route = (path("admin" / "initdb") & post) {
     logger.debug("Doing POST /admin/initdb")
-    ExchConfig.createRootInCache()  // need to do this before authenticating, because dropdb cleared it out (can not do this in dropdb, because it might expire)
-    exchAuth(TAction(), Access.ADMIN, hint = "token") { _ =>
-      complete({
-        db.run(ExchangeApiTables.initDB.transactionally.asTry).map({
-          case Success(v) =>
-            logger.debug(s"POST /admin/initdb result: $v")
-            ExchConfig.createRoot(db)         // initialize the users table with the root user from config.json
-            (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("db.init")))
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("db.not.init", t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("db.not.init", t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      ExchConfig.createRootInCache()  // need to do this before authenticating, because dropdb cleared it out (can not do this in dropdb, because it might expire)
+      exchAuth(TAction(), Access.ADMIN, hint = "token") { _ =>
+        complete({
+          db.run(ExchangeApiTables.initDB.transactionally.asTry).map({
+            case Success(v) =>
+              logger.debug(s"POST /admin/initdb result: $v")
+              ExchConfig.createRoot(db)         // initialize the users table with the root user from config.json
+              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("db.init")))
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("db.not.init", t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("db.not.init", t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== GET /admin/version ===============================
@@ -278,50 +291,53 @@ trait AdminRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied")))
   def adminGetStatusRoute: Route = (path("admin" / "status") & get) {
     logger.debug("Doing GET /admin/status")
-    exchAuth(TAction(), Access.STATUS) { _ =>
-      complete({
-        val statusResp = new AdminStatus()
-        //perf: use a DBIO.sequence instead. It does essentially the same thing, but more efficiently
-        db.run(UsersTQ.rows.length.result.asTry.flatMap({
-          case Success(v) => statusResp.numberOfUsers = v
-            NodesTQ.rows.length.result.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) => statusResp.numberOfNodes = v
-            AgbotsTQ.rows.length.result.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) => statusResp.numberOfAgbots = v
-            NodeAgreementsTQ.rows.length.result.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) => statusResp.numberOfNodeAgreements = v
-            AgbotAgreementsTQ.rows.length.result.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) => statusResp.numberOfAgbotAgreements = v
-            NodeMsgsTQ.rows.length.result.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) => statusResp.numberOfNodeMsgs = v
-            AgbotMsgsTQ.rows.length.result.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        }).flatMap({
-          case Success(v) => statusResp.numberOfAgbotMsgs = v
-            SchemaTQ.getSchemaVersion.result.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) => statusResp.dbSchemaVersion = v.head
-            statusResp.msg = ExchMsg.translate("exchange.server.operating.normally")
-            (HttpCode.OK, statusResp.toGetAdminStatusResponse)
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            if (t.getMessage.contains("An I/O error occurred while sending to the backend")) (HttpCode.BAD_GW, statusResp.toGetAdminStatusResponse)
-            else (HttpCode.INTERNAL_ERROR, statusResp.toGetAdminStatusResponse)
-          case Failure(t) => statusResp.msg = t.getMessage
-            (HttpCode.INTERNAL_ERROR, statusResp.toGetAdminStatusResponse)
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAction(), Access.STATUS) { _ =>
+        complete({
+          val statusResp = new AdminStatus()
+          //perf: use a DBIO.sequence instead. It does essentially the same thing, but more efficiently
+          db.run(UsersTQ.rows.length.result.asTry.flatMap({
+            case Success(v) => statusResp.numberOfUsers = v
+              NodesTQ.rows.length.result.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) => statusResp.numberOfNodes = v
+              AgbotsTQ.rows.length.result.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) => statusResp.numberOfAgbots = v
+              NodeAgreementsTQ.rows.length.result.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) => statusResp.numberOfNodeAgreements = v
+              AgbotAgreementsTQ.rows.length.result.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) => statusResp.numberOfAgbotAgreements = v
+              NodeMsgsTQ.rows.length.result.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) => statusResp.numberOfNodeMsgs = v
+              AgbotMsgsTQ.rows.length.result.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          }).flatMap({
+            case Success(v) => statusResp.numberOfAgbotMsgs = v
+              SchemaTQ.getSchemaVersion.result.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) => statusResp.dbSchemaVersion = v.head
+              statusResp.msg = ExchMsg.translate("exchange.server.operating.normally")
+              (HttpCode.OK, statusResp.toGetAdminStatusResponse)
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              if (t.getMessage.contains("An I/O error occurred while sending to the backend")) (HttpCode.BAD_GW, statusResp.toGetAdminStatusResponse)
+              else (HttpCode.INTERNAL_ERROR, statusResp.toGetAdminStatusResponse)
+            case Failure(t) => statusResp.msg = t.getMessage
+              (HttpCode.INTERNAL_ERROR, statusResp.toGetAdminStatusResponse)
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== GET /admin/orgstatus ===============================
@@ -335,54 +351,63 @@ trait AdminRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied")))
   def adminGetOrgStatusRoute: Route = (path("admin" / "orgstatus") & get) {
     logger.debug("Doing GET /admin/orgstatus")
-    exchAuth(TAction(), Access.ORGSTATUS) { _ =>
-      complete({
-        val orgStatusResp = new AdminOrgStatus()
-        //perf: use a DBIO.sequence instead. It does essentially the same thing, but more efficiently
-        val q = for {
-          n <- NodesTQ.rows.groupBy(_.orgid)
-        } yield (n._1, n._2.length) // this should returin [orgid, num of nodes in that orgid]
-        db.run(q.result.asTry).map({
-          case Success(nodes) =>
-            // nodes : Seq[(String, Int)]
-            orgStatusResp.nodesByOrg = nodes.toMap
-            orgStatusResp.msg = ExchMsg.translate("exchange.server.operating.normally")
-            (HttpCode.OK, orgStatusResp.toGetAdminOrgStatusResponse)
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            orgStatusResp.msg = t.getMessage
-            if (t.getMessage.contains("An I/O error occurred while sending to the backend")) (HttpCode.BAD_GW, orgStatusResp.toGetAdminOrgStatusResponse)
-            else (HttpCode.INTERNAL_ERROR, orgStatusResp.toGetAdminOrgStatusResponse)
-          case Failure(t) => orgStatusResp.msg = t.getMessage
-            (HttpCode.INTERNAL_ERROR, orgStatusResp.toGetAdminOrgStatusResponse)
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAction(), Access.ORGSTATUS) { _ =>
+        complete({
+          val orgStatusResp = new AdminOrgStatus()
+          //perf: use a DBIO.sequence instead. It does essentially the same thing, but more efficiently
+          val q = for {
+            n <- NodesTQ.rows.groupBy(_.orgid)
+          } yield (n._1, n._2.length) // this should returin [orgid, num of nodes in that orgid]
+          db.run(q.result.asTry).map({
+            case Success(nodes) =>
+              // nodes : Seq[(String, Int)]
+              orgStatusResp.nodesByOrg = nodes.toMap
+              orgStatusResp.msg = ExchMsg.translate("exchange.server.operating.normally")
+              (HttpCode.OK, orgStatusResp.toGetAdminOrgStatusResponse)
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              orgStatusResp.msg = t.getMessage
+              if (t.getMessage.contains("An I/O error occurred while sending to the backend")) (HttpCode.BAD_GW, orgStatusResp.toGetAdminOrgStatusResponse)
+              else (HttpCode.INTERNAL_ERROR, orgStatusResp.toGetAdminOrgStatusResponse)
+            case Failure(t) => orgStatusResp.msg = t.getMessage
+              (HttpCode.INTERNAL_ERROR, orgStatusResp.toGetAdminOrgStatusResponse)
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /** set 1 or more variables in the in-memory config (does not affect all instances in multi-node mode).
    * Intentionally not put swagger, because only used by automated tests. */
   def adminConfigRoute: Route = (path("admin" / "config") & put & entity(as[AdminConfigRequest])) { reqBody =>
     logger.debug(s"Doing POST /admin/config")
-    exchAuth(TAction(), Access.ADMIN) { _ =>
-      complete({
-        val props = new Properties()
-        props.setProperty(reqBody.varPath, reqBody.value)
-        ExchConfig.mod(props)
-        (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("config.value.set")))
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAction(), Access.ADMIN) { _ =>
+        complete({
+          val props = new Properties()
+          props.setProperty(reqBody.varPath, reqBody.value)
+          ExchConfig.mod(props)
+          (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("config.value.set")))
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /admin/clearAuthCaches ===============================
   def adminClearCacheRoute: Route = (path("admin" / "clearauthcaches") & post) {
     logger.debug("Doing POST /admin/clearauthcaches")
-    exchAuth(TAction(), Access.ADMIN) { _ =>
-      complete({
-        //todo: ensure other client requests are not updating the cache at the same time
-        AuthCache.clearAllCaches(includingIbmAuth=true)
-        (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("cache.cleared")))
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAction(), Access.ADMIN) { _ =>
+        complete({
+          //todo: ensure other client requests are not updating the cache at the same time
+          AuthCache.clearAllCaches(includingIbmAuth=true)
+          (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("cache.cleared")))
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== DELETE /orgs/<orgid>/changes/cleanup ================================ */
@@ -390,25 +415,28 @@ trait AdminRoutes extends JacksonSupport with AuthenticationSupport {
   // Otherwise the changes table gets clogged with entries in the orgs from testing
   def adminDeleteOrgChangesRoute: Route = (path("orgs" / Segment / "changes" / "cleanup") & delete & entity(as[DeleteOrgChangesRequest])) { (orgId, reqBody) =>
     logger.debug(s"Doing POST /orgs/$orgId/changes/cleanup")
-    exchAuth(TAction(), Access.ADMIN) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          val resourcesSet: Set[String] = reqBody.resources.toSet
-          var action = ResourceChangesTQ.rows.filter(_.orgId === orgId).filter(_.id inSet resourcesSet).delete
-          if (reqBody.resources.isEmpty) action = ResourceChangesTQ.rows.filter(_.orgId === orgId).delete
-          db.run(action.transactionally.asTry).map({
-            case Success(v) =>
-              logger.debug(s"Deleted specified $orgId org entries in changes table ONLY FOR UNIT TESTS: $v")
-              if (v > 0) (HttpCode.DELETED, ApiResponse(ApiRespType.OK, s"$orgId changes deleted"))
-              else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId)))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, s"$orgId org changes not deleted: " + t.toString)
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, s"$orgId org changes not deleted: " + t.toString))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAction(), Access.ADMIN) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            val resourcesSet: Set[String] = reqBody.resources.toSet
+            var action = ResourceChangesTQ.rows.filter(_.orgId === orgId).filter(_.id inSet resourcesSet).delete
+            if (reqBody.resources.isEmpty) action = ResourceChangesTQ.rows.filter(_.orgId === orgId).delete
+            db.run(action.transactionally.asTry).map({
+              case Success(v) =>
+                logger.debug(s"Deleted specified $orgId org entries in changes table ONLY FOR UNIT TESTS: $v")
+                if (v > 0) (HttpCode.DELETED, ApiResponse(ApiRespType.OK, s"$orgId changes deleted"))
+                else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId)))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, s"$orgId org changes not deleted: " + t.toString)
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, s"$orgId org changes not deleted: " + t.toString))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
 }

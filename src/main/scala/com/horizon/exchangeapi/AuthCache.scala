@@ -1,8 +1,8 @@
 package com.horizon.exchangeapi
 
 import java.util.concurrent.TimeUnit
-
 import akka.event.LoggingAdapter
+import akka.http.scaladsl.model.headers.Language
 import com.google.common.cache
 
 import scala.concurrent.ExecutionContext
@@ -57,7 +57,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     def init(db: Database): Unit = { this.db = db } // we intentionally don't prime the cache. We let it build on every access so we can add the unhashed token
 
     // Try to authenticate the creds and return the type (user/node/agbot) it is, or None
-    def getValidType(creds: Creds, alreadyRetried: Boolean = false): Try[CacheIdType] = {
+    def getValidType(creds: Creds, alreadyRetried: Boolean = false)(implicit acceptLang: Language): Try[CacheIdType] = {
       //logger.debug("CacheId:getValidType(): attempting to authenticate to the exchange with " + creds)
       val cacheValue: Try[CacheVal] = getCacheValue(creds)
       logger.debug("cacheValue: " + cacheValue)
@@ -90,7 +90,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
 
     // Returns the cache value associated with this creds.id. If not in the cache, it will run the code block, add it to the cache, then return it.
     // (I currently don't know how to make the cachingF function run and get its value w/o putting it in a separate method.)
-    private def getCacheValue(creds: Creds): Try[CacheVal] = {
+    private def getCacheValue(creds: Creds)(implicit acceptLang: Language): Try[CacheVal] = {
       cachingF(creds.id)(ttl = None) {
         // Tries each type of id until it finds it (then it just nominally calls the remaining methods).
         // The for comprehension will kick out if any of the methods return a Try failure. Otherwise it unwraps the Try object before going to the next one.
@@ -103,7 +103,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     }
 
     // Get the id of this type from the db, if there
-    private def getId(creds: Creds, dbAction: DBIO[Seq[String]], idType: CacheIdType, cacheValOpt: Option[CacheVal], last: Boolean = false): Try[Option[CacheVal]] = {
+    private def getId(creds: Creds, dbAction: DBIO[Seq[String]], idType: CacheIdType, cacheValOpt: Option[CacheVal], last: Boolean = false)(implicit acceptLang: Language): Try[Option[CacheVal]] = {
       if (cacheValOpt.isDefined) return Success(cacheValOpt) // short circuit the search because we already found it
 
       logger.debug(s"CacheId:getId(): ${creds.id} was not in the cache, so attempting to get it from the $idType db table")
@@ -141,7 +141,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     }
 
     // Called for temp token creation/validation. Note: this method just gets the hashed pw, it doesn't check it against provided creds
-    def getOne(id: String): Option[String] = {
+    def getOne(id: String)(implicit acceptLang: Language): Option[String] = {
       val cacheValue: Try[CacheVal] = getCacheValue(Creds(id, ""))
       if (cacheValue.isSuccess) Some(cacheValue.get.hashedToken)
       else None
@@ -188,7 +188,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     def getDbAction(id: String): DBIO[Seq[Boolean]]
 
     // I currently don't know how to make the cachingF function run and get its value w/o putting it in a separate method
-    private def getCacheValue(id: String): Try[Boolean] = {
+    private def getCacheValue(id: String)(implicit acceptLang: Language): Try[Boolean] = {
       cachingF(id)(ttl = None) {
         for {
           userVal <- getId(id)
@@ -197,7 +197,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     }
 
     // Called when this user id isn't in the cache. Gets the user from the db and puts the boolean value in the cache.
-    private def getId(id: String): Try[Boolean] = {
+    private def getId(id: String)(implicit acceptLang: Language): Try[Boolean] = {
       //logger.debug("CacheBoolean:getId(): " + id + " was not in the cache, so attempting to get it from the db")
       //val dbAction = UsersTQ.getAdmin(id).result
       try {
@@ -220,7 +220,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
       }
     }
 
-    def getOne(id: String): Option[Boolean] = {
+    def getOne(id: String)(implicit acceptLang: Language): Option[Boolean] = {
       val cacheValue: Try[Boolean] = getCacheValue(id)
       if (cacheValue.isSuccess) Some(cacheValue.get)
       else None
@@ -276,7 +276,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     def getDbAction(id: String): DBIO[Seq[String]]
 
     // I currently don't know how to make the cachingF function run and get its value w/o putting it in a separate method
-    private def getCacheValue(id: String): Try[String] = {
+    private def getCacheValue(id: String)(implicit acceptLang: Language): Try[String] = {
       cachingF(id)(ttl = None) {
         for {
           userVal <- getId(id)
@@ -285,7 +285,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     }
 
     // Called when this id isn't in the cache. Gets the id from the db and puts the owner in the cache.
-    private def getId(id: String): Try[String] = {
+    private def getId(id: String)(implicit acceptLang: Language): Try[String] = {
       logger.debug("CacheOwner:getId(): " + id + " was not in the cache, so attempting to get it from the db")
       try {
         //logger.debug("CacheOwner:getId(): awaiting for DB query of local exchange admin value for "+id+"...")
@@ -307,7 +307,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
       }
     }
 
-    def getOne(id: String): Option[String] = {
+    def getOne(id: String)(implicit acceptLang: Language): Option[String] = {
       val cacheValue: Try[String] = getCacheValue(id)
       if (cacheValue.isSuccess) Some(cacheValue.get)
       else None
@@ -344,7 +344,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
   }
 
   //perf: These methods were originally here to allow us to use either the new or old cache. We maybe can eliminate them now.
-  def getUser(id: String): Option[String] = {
+  def getUser(id: String)(implicit acceptLang: Language): Option[String] = {
     ids.getOne(id)
   }
 
@@ -352,7 +352,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     ids.putUser(id, hashedPw, unhashedPw)
   }
 
-  def getUserIsAdmin(id: String): Option[Boolean] = {
+  def getUserIsAdmin(id: String)(implicit acceptLang: Language): Option[Boolean] = {
     usersAdmin.getOne(id)
   }
 
@@ -371,7 +371,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     usersHubAdmin.removeOne(id)
   }
 
-  def getUserIsHubAdmin(id: String): Option[Boolean] = {
+  def getUserIsHubAdmin(id: String)(implicit acceptLang: Language): Option[Boolean] = {
     usersHubAdmin.getOne(id)
   }
 
@@ -384,7 +384,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     usersHubAdmin.putOne(id, isHubAdmin)
   }
 
-  def getNodeOwner(id: String): Option[String] = {
+  def getNodeOwner(id: String)(implicit acceptLang: Language): Option[String] = {
     nodesOwner.getOne(id)
   }
 
@@ -402,7 +402,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     nodesOwner.removeOne(id)
   }
 
-  def getAgbotOwner(id: String): Option[String] = {
+  def getAgbotOwner(id: String)(implicit acceptLang: Language): Option[String] = {
     agbotsOwner.getOne(id)
   }
 
@@ -420,7 +420,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     agbotsOwner.removeOne(id)
   }
 
-  def getServiceOwner(id: String): Option[String] = {
+  def getServiceOwner(id: String)(implicit acceptLang: Language): Option[String] = {
     servicesOwner.getOne(id)
   }
 
@@ -432,7 +432,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     servicesOwner.removeOne(id)
   }
 
-  def getServiceIsPublic(id: String): Option[Boolean] = {
+  def getServiceIsPublic(id: String)(implicit acceptLang: Language): Option[Boolean] = {
     servicesPublic.getOne(id)
   }
 
@@ -444,7 +444,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     servicesPublic.removeOne(id)
   }
 
-  def getPatternOwner(id: String): Option[String] = {
+  def getPatternOwner(id: String)(implicit acceptLang: Language): Option[String] = {
     patternsOwner.getOne(id)
   }
 
@@ -456,7 +456,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     patternsOwner.removeOne(id)
   }
 
-  def getPatternIsPublic(id: String): Option[Boolean] = {
+  def getPatternIsPublic(id: String)(implicit acceptLang: Language): Option[Boolean] = {
     patternsPublic.getOne(id)
   }
 
@@ -468,7 +468,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     patternsPublic.removeOne(id)
   }
 
-  def getBusinessOwner(id: String): Option[String] = {
+  def getBusinessOwner(id: String)(implicit acceptLang: Language): Option[String] = {
     businessOwner.getOne(id)
   }
 
@@ -507,7 +507,7 @@ object AuthCache /* extends Control with ServletApiImplicits */ {
     if (includingIbmAuth) IbmCloudAuth.clearCache()
   }
 
-  def initAllCaches(db: Database, includingIbmAuth: Boolean): Unit = {
+  def initAllCaches(db: Database, includingIbmAuth: Boolean)(implicit acceptLang: Language): Unit = {
     ExchConfig.createRoot(db)
     ids.init(db)
     usersAdmin.init(db)

@@ -1,5 +1,7 @@
 package com.horizon.exchangeapi.tables
 
+import akka.http.scaladsl.model.headers.Language
+
 import scala.collection.mutable.{ListBuffer, HashMap => MutableHashMap}
 import org.json4s.{DefaultFormats, Formats}
 import org.json4s.jackson.Serialization.read
@@ -16,7 +18,7 @@ trait RegServiceTrait {
   def properties: List[Prop]
 
   /** Returns an error msg if the user input is invalid. */
-  def validate: Option[String] = {
+  def validate(implicit acceptLang: Language): Option[String] = {
     for (p <- properties) {
       p.validate match {
         case Some(msg) => return Option[String](url+": "+msg)     // prepend the url so they know which service was bad
@@ -434,7 +436,7 @@ final case class Prop(name: String, value: String, propType: String, op: String)
   //def toPropRow(nodeId: String, msUrl: String) = PropRow(nodeId+"|"+msUrl+"|"+name, nodeId+"|"+msUrl, name, value, propType, op)
 
   /** Returns an error msg if the user input is invalid. */
-  def validate: Option[String] = {
+  def validate(implicit acceptLang: Language): Option[String] = {
     if (!PropType.contains(propType)) return Option[String](ExchMsg.translate("invalid.proptype.for.name", propType, name))
     if (!Op.contains(op)) return Option[String](ExchMsg.translate("invalid.op.for.name", op, name))
     if (propType==PropType.BOOLEAN) {

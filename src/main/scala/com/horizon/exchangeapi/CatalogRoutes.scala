@@ -19,6 +19,7 @@ import org.json4s.jackson.Serialization.read
 import slick.jdbc.PostgresProfile.api._
 
 import scala.util.{Failure, Success}
+import akka.http.scaladsl.model.headers.Language
 
 
 // Provides routes for browsing the services and patterns in the IBM catalog
@@ -493,39 +494,54 @@ trait CatalogRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied"),
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def catalogGetPatternsAll: Route = (path("catalog" / Segment / "patterns") & get & parameter((Symbol("idfilter").?, Symbol("owner").?, Symbol("public").?, Symbol("label").?, Symbol("description").?))) { (orgid, idfilter, owner, public, label, description) =>
-    exchAuth(TPattern(OrgAndId(orgid, "*").toString), Access.READ) { ident =>
-      validate(public.isEmpty || (public.get.toLowerCase == "true" || public.get.toLowerCase == "false"), ExchMsg.translate("bad.public.param")) {
-        complete({
-          logger.debug("ORGID: "+ orgid)
-          //var q = PatternsTQ.rows.subquery
-          var q = PatternsTQ.getAllPatterns(orgid)
-          // If multiple filters are specified they are anded together by adding the next filter to the previous filter by using q.filter
-          idfilter.foreach(id => { if (id.contains("%")) q = q.filter(_.pattern like id) else q = q.filter(_.pattern === id) })
-          owner.foreach(owner => { if (owner.contains("%")) q = q.filter(_.owner like owner) else q = q.filter(_.owner === owner) })
-          public.foreach(public => { if (public.toLowerCase == "true") q = q.filter(_.public === true) else q = q.filter(_.public === false) })
-          label.foreach(lab => { if (lab.contains("%")) q = q.filter(_.label like lab) else q = q.filter(_.label === lab) })
-          description.foreach(desc => { if (desc.contains("%")) q = q.filter(_.description like desc) else q = q.filter(_.description === desc) })
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TPattern(OrgAndId(orgid, "*").toString), Access.READ) { ident =>
+        validate(public.isEmpty || (public.get.toLowerCase == "true" || public.get.toLowerCase == "false"), ExchMsg.translate("bad.public.param")) {
+          complete({
+            logger.debug("ORGID: " + orgid)
+            //var q = PatternsTQ.rows.subquery
+            var q = PatternsTQ.getAllPatterns(orgid)
+            // If multiple filters are specified they are anded together by adding the next filter to the previous filter by using q.filter
+            idfilter.foreach(id => {
+              if (id.contains("%")) q = q.filter(_.pattern like id) else q = q.filter(_.pattern === id)
+            })
+            owner.foreach(owner => {
+              if (owner.contains("%")) q = q.filter(_.owner like owner) else q = q.filter(_.owner === owner)
+            })
+            public.foreach(public => {
+              if (public.toLowerCase == "true") q = q.filter(_.public === true) else q = q.filter(_.public === false)
+            })
+            label.foreach(lab => {
+              if (lab.contains("%")) q = q.filter(_.label like lab) else q = q.filter(_.label === lab)
+            })
+            description.foreach(desc => {
+              if (desc.contains("%")) q = q.filter(_.description like desc) else q = q.filter(_.description === desc)
+            })
 
-          val svcQuery = for {
-            (_, svc) <- OrgsTQ.getOrgidsOfType("IBM") join PatternsTQ.rows on ((o, s) => {o === s.orgid && s.public})
-          } yield svc
+            val svcQuery = for {
+              (_, svc) <- OrgsTQ.getOrgidsOfType("IBM") join PatternsTQ.rows on ((o, s) => {
+                o === s.orgid && s.public
+              })
+            } yield svc
 
-          var allPatterns : Map[String, Pattern] = null
-          db.run(q.result.flatMap({ list =>
-            logger.debug("GET /catalog/"+orgid+"/patterns org result size: "+list.size)
-            val patterns: Map[String, Pattern] = list.filter(e => ident.getOrg == e.orgid || e.public || ident.isSuperUser || ident.isMultiTenantAgbot).map(e => e.pattern -> e.toPattern).toMap
-            allPatterns = patterns
-            svcQuery.result
-          })).map({ list =>
-            logger.debug("GET /orgs/"+orgid+"/patterns IBM result size: "+list.size)
-            val patterns: Map[String, Pattern] = list.map(a => a.pattern -> a.toPattern).toMap
-            allPatterns = allPatterns ++ patterns
-            val code: StatusCode with Serializable = if (allPatterns.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-            (code, GetPatternsResponse(allPatterns, 0))
-          })
-        }) // end of complete
-      } // end of validate
-    } // end of exchAuth
+            var allPatterns: Map[String, Pattern] = null
+            db.run(q.result.flatMap({ list =>
+              logger.debug("GET /catalog/" + orgid + "/patterns org result size: " + list.size)
+              val patterns: Map[String, Pattern] = list.filter(e => ident.getOrg == e.orgid || e.public || ident.isSuperUser || ident.isMultiTenantAgbot).map(e => e.pattern -> e.toPattern).toMap
+              allPatterns = patterns
+              svcQuery.result
+            })).map({ list =>
+              logger.debug("GET /orgs/" + orgid + "/patterns IBM result size: " + list.size)
+              val patterns: Map[String, Pattern] = list.map(a => a.pattern -> a.toPattern).toMap
+              allPatterns = allPatterns ++ patterns
+              val code: StatusCode with Serializable = if (allPatterns.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+              (code, GetPatternsResponse(allPatterns, 0))
+            })
+          }) // end of complete
+        } // end of validate
+      } // end of exchAuth
+    }
   }
 
 }

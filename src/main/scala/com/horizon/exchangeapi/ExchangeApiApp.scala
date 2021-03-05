@@ -33,6 +33,7 @@ import slick.jdbc.TransactionIsolation.Serializable
 
 import scala.io.{BufferedSource, Source}
 import scala.concurrent.duration._
+import akka.http.scaladsl.model.headers.Language
 
 // Global vals and methods
 object ExchangeApi {
@@ -166,11 +167,10 @@ object ExchangeApiApp extends App with OrgsRoutes with UsersRoutes with NodesRou
   def testRoute = { path("test") { get { logger.debug("In /test"); complete(testResp("OK")) } } }
 
   //someday: use directive https://doc.akka.io/docs/akka-http/current/routing-dsl/directives/misc-directives/selectPreferredLanguage.html to support a different language for each client
-  lazy val routes: Route = DebuggingDirectives.logRequestResult(requestResponseLogging _) { pathPrefix("v1") { testRoute ~ orgsRoutes ~ usersRoutes ~ nodesRoutes ~ agbotsRoutes ~ servicesRoutes ~ patternsRoutes ~ businessRoutes ~ catalogRoutes ~ adminRoutes ~ SwaggerDocService.routes ~ swaggerUiRoutes } }
+  lazy val routes: Route = DebuggingDirectives.logRequestResult(requestResponseLogging _) { pathPrefix("v1") { testRoute ~ orgsRoutes ~ usersRoutes ~ nodesRoutes ~ agbotsRoutes ~ servicesRoutes ~ patternsRoutes ~ businessRoutes ~ catalogRoutes ~ adminRoutes ~ SwaggerDocService.routes ~ swaggerUiRoutes}}
 
   // Load the db backend. The db access info must be in config.json
   // https://www.mchange.com/projects/c3p0/#configuration_properties
-  
   var cpds: ComboPooledDataSource = new ComboPooledDataSource()
   cpds.setAcquireIncrement(ExchConfig.getInt("api.db.acquireIncrement"))
   cpds.setDriverClass(ExchConfig.getString("api.db.driverClass")) //loads the jdbc driver

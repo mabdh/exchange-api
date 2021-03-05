@@ -23,6 +23,7 @@ import scala.util._
 
 import com.horizon.exchangeapi.tables._
 import com.horizon.exchangeapi.auth.DBProcessingError
+import akka.http.scaladsl.model.headers.Language
 
 //====== These are the input and output structures for /agbots routes. Swagger and/or json seem to require they be outside the trait.
 
@@ -34,7 +35,7 @@ final case class GetAgbotAttributeResponse(attribute: String, value: String)
 final case class PutAgbotsRequest(token: String, name: String, msgEndPoint: Option[String], publicKey: String) {
   require(token!=null && name!=null && publicKey!=null)
   protected implicit val jsonFormats: Formats = DefaultFormats
-  def getAnyProblem: Option[String] = {
+  def getAnyProblem(implicit acceptLang: Language): Option[String] = {
     if (token == "") Some(ExchMsg.translate("token.specified.cannot.be.blank"))
     else None
   }
@@ -48,7 +49,7 @@ final case class PutAgbotsRequest(token: String, name: String, msgEndPoint: Opti
 
 final case class PatchAgbotsRequest(token: Option[String], name: Option[String], msgEndPoint: Option[String], publicKey: Option[String]) {
   protected implicit val jsonFormats: Formats = DefaultFormats
-  def getAnyProblem: Option[String] = {
+  def getAnyProblem(implicit acceptLang: Language): Option[String] = {
     if (token.isDefined && token.get == "") Some(ExchMsg.translate("token.cannot.be.empty.string"))
     //else if (!requestBody.trim.startsWith("{") && !requestBody.trim.endsWith("}")) Some(ExchMsg.translate("invalid.input.message", requestBody))
     else None
@@ -92,10 +93,11 @@ final case class GetAgbotBusinessPolsResponse(businessPols: Map[String,AgbotBusi
 /** Input format for POST /orgs/{orgid}/agbots/{id}/businesspols */
 final case class PostAgbotBusinessPolRequest(businessPolOrgid: String, businessPol: String, nodeOrgid: Option[String]) {
   require(businessPolOrgid!=null && businessPol!=null)
+
   def toAgbotBusinessPol: AgbotBusinessPol = AgbotBusinessPol(businessPolOrgid, businessPol, nodeOrgid.getOrElse(businessPolOrgid), ApiTime.nowUTC)
   def toAgbotBusinessPolRow(agbotId: String, busPolId: String): AgbotBusinessPolRow = AgbotBusinessPolRow(busPolId, agbotId, businessPolOrgid, businessPol, nodeOrgid.getOrElse(businessPolOrgid), ApiTime.nowUTC)
   def formId: String = businessPolOrgid + "_" + businessPol + "_" + nodeOrgid.getOrElse(businessPolOrgid)
-  def getAnyProblem: Option[String] = {
+  def getAnyProblem(implicit acceptLang: Language): Option[String] = {
     val nodeOrg: String = nodeOrgid.getOrElse(businessPolOrgid)
     if (nodeOrg != businessPolOrgid) Some(ExchMsg.translate("node.org.must.equal.bus.pol.org"))
     else None
@@ -268,31 +270,34 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot")
   def agbotGetRoute: Route = (path("orgs" / Segment / "agbots" / Segment) & get & parameter(Symbol("attribute").?)) { (orgid, id, attribute) =>
     logger.debug(s"Doing GET /orgs/$orgid/agbots/$id")
-    val compositeId: String = OrgAndId(orgid, id).toString
-    exchAuth(TAgbot(compositeId), Access.READ) { ident =>
-      val q = if (attribute.isDefined) AgbotsTQ.getAttribute(compositeId, attribute.get) else null
-      validate(attribute.isEmpty || q!= null, ExchMsg.translate("agbot.name.not.in.resource")) {
-        complete({
-          logger.debug(s"GET /orgs/$orgid/agbots/$id identity: ${ident.creds.id}") // can't display the whole ident object, because that contains the pw/token
-          attribute match {
-            case Some(attr) => // Only returning 1 attr of the agbot
-              db.run(q.result).map({ list =>
-                //logger.debug("GET /orgs/"+orgid+"/agbots/"+id+" attribute result: "+list.toString)
-                if (list.nonEmpty) (HttpCode.OK, GetAgbotAttributeResponse(attr, list.head.toString))
-                else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))     // validateAccessToAgbot() will return ApiRespType.NOT_FOUND to the client so do that here for consistency
-              })
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId: String = OrgAndId(orgid, id).toString
+      exchAuth(TAgbot(compositeId), Access.READ) { ident =>
+        val q = if (attribute.isDefined) AgbotsTQ.getAttribute(compositeId, attribute.get) else null
+        validate(attribute.isEmpty || q!= null, ExchMsg.translate("agbot.name.not.in.resource")) {
+          complete({
+            logger.debug(s"GET /orgs/$orgid/agbots/$id identity: ${ident.creds.id}") // can't display the whole ident object, because that contains the pw/token
+            attribute match {
+              case Some(attr) => // Only returning 1 attr of the agbot
+                db.run(q.result).map({ list =>
+                  //logger.debug("GET /orgs/"+orgid+"/agbots/"+id+" attribute result: "+list.toString)
+                  if (list.nonEmpty) (HttpCode.OK, GetAgbotAttributeResponse(attr, list.head.toString))
+                  else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))     // validateAccessToAgbot() will return ApiRespType.NOT_FOUND to the client so do that here for consistency
+                })
 
-            case None => // Return the whole agbot, including the services
-              db.run(AgbotsTQ.getAgbot(compositeId).result).map({ list =>
-                logger.debug(s"GET /orgs/$orgid/agbots result size: ${list.size}")
-                val agbots: Map[String, Agbot] = list.map(e => e.id -> e.toAgbot(ident.isSuperUser)).toMap
-                val code: StatusCode with Serializable = if (agbots.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-                (code, GetAgbotsResponse(agbots, 0))
-              })
-          }
-        }) // end of complete
-      } // end of validate
-    } // end of exchAuth
+              case None => // Return the whole agbot, including the services
+                db.run(AgbotsTQ.getAgbot(compositeId).result).map({ list =>
+                  logger.debug(s"GET /orgs/$orgid/agbots result size: ${list.size}")
+                  val agbots: Map[String, Agbot] = list.map(e => e.id -> e.toAgbot(ident.isSuperUser)).toMap
+                  val code: StatusCode with Serializable = if (agbots.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+                  (code, GetAgbotsResponse(agbots, 0))
+                })
+            }
+          }) // end of complete
+        } // end of validate
+      } // end of exchAuth
+    }
   }
 
   // =========== PUT /orgs/{orgid}/agbots/{id} ===============================
@@ -359,42 +364,45 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot")
   def agbotPutRoute: Route = (path("orgs" / Segment / "agbots" / Segment) & put & entity(as[PutAgbotsRequest])) { (orgid, id, reqBody) =>
     logger.debug(s"Doing PUT /orgs/$orgid/agbots/$id")
-    val compositeId = OrgAndId(orgid, id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { ident =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          val owner = ident match { case IUser(creds) => creds.id; case _ => "" }
-          val hashedTok = Password.hash(reqBody.token)
-          db.run(AgbotsTQ.getNumOwned(owner).result.flatMap({ xs =>
-            logger.debug("PUT /orgs/"+orgid+"/agbots/"+id+" num owned: "+xs)
-            val numOwned = xs
-            val maxAgbots = ExchConfig.getInt("api.limits.maxAgbots")
-            if (maxAgbots == 0 || numOwned <= maxAgbots || owner == "") {    // when owner=="" we know it is only an update, otherwise we are not sure, but if they are already over the limit, stop them anyway
-              val action = if (owner == "") reqBody.getDbUpdate(compositeId, orgid, owner, hashedTok) else reqBody.getDbUpsert(compositeId, orgid, owner, hashedTok)
-              action.asTry
-            }
-            else DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.max.limit.of.agbots", maxAgbots) )).asTry
-          }).flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug(s"PUT /orgs/$orgid/agbots/$id result: $v")
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOT, ResChangeOperation.CREATEDMODIFIED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug(s"PUT /orgs/$orgid/agbots/$id updated in changes table: $v")
-              AuthCache.putAgbotAndOwner(compositeId, hashedTok, reqBody.token, owner)
-              (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.added.updated")))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.not.inserted.or.updated", compositeId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.not.inserted.or.updated", compositeId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid, id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { ident =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            val owner = ident match { case IUser(creds) => creds.id; case _ => "" }
+            val hashedTok = Password.hash(reqBody.token)
+            db.run(AgbotsTQ.getNumOwned(owner).result.flatMap({ xs =>
+              logger.debug("PUT /orgs/"+orgid+"/agbots/"+id+" num owned: "+xs)
+              val numOwned = xs
+              val maxAgbots = ExchConfig.getInt("api.limits.maxAgbots")
+              if (maxAgbots == 0 || numOwned <= maxAgbots || owner == "") {    // when owner=="" we know it is only an update, otherwise we are not sure, but if they are already over the limit, stop them anyway
+                val action = if (owner == "") reqBody.getDbUpdate(compositeId, orgid, owner, hashedTok) else reqBody.getDbUpsert(compositeId, orgid, owner, hashedTok)
+                action.asTry
+              }
+              else DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.max.limit.of.agbots", maxAgbots) )).asTry
+            }).flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                logger.debug(s"PUT /orgs/$orgid/agbots/$id result: $v")
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOT, ResChangeOperation.CREATEDMODIFIED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug(s"PUT /orgs/$orgid/agbots/$id updated in changes table: $v")
+                AuthCache.putAgbotAndOwner(compositeId, hashedTok, reqBody.token, owner)
+                (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.added.updated")))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.not.inserted.or.updated", compositeId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.not.inserted.or.updated", compositeId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== PATCH /orgs/{orgid}/agbots/{id} ===============================
@@ -428,38 +436,41 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot")
   def agbotPatchRoute: Route = (path("orgs" / Segment / "agbots" / Segment) & patch & entity(as[PatchAgbotsRequest])) { (orgid, id, reqBody) =>
     logger.debug(s"Doing PATCH /orgs/$orgid/agbots/$id")
-    val compositeId = OrgAndId(orgid, id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          val hashedTok = if (reqBody.token.isDefined) Password.hash(reqBody.token.get) else "" // hash the token if that is what is being updated
-          val (action, attrName) = reqBody.getDbUpdate(compositeId, orgid, hashedTok)
-          if (action == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("no.valid.agbot.attribute.specified")))
-          else db.run(action.transactionally.asTry.flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug(s"PATCH /orgs/$orgid/agbots/$id result: $v")
-              if (v.asInstanceOf[Int] > 0) { // there were no db errors, but determine if it actually found it or not
-                if (reqBody.token.isDefined) AuthCache.putAgbot(compositeId, hashedTok, reqBody.token.get) // We do not need to run putOwner because patch does not change the owner
-                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOT, ResChangeOperation.MODIFIED).insert.asTry
-              } else {
-                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("agbot.not.found", compositeId))).asTry
-              }
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug(s"PATCH /orgs/$orgid/agbots/$id updated in changes table: $v")
-              (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.attribute.updated", attrName, compositeId)))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.not.inserted.or.updated", compositeId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.not.inserted.or.updated", compositeId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid, id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            val hashedTok = if (reqBody.token.isDefined) Password.hash(reqBody.token.get) else "" // hash the token if that is what is being updated
+            val (action, attrName) = reqBody.getDbUpdate(compositeId, orgid, hashedTok)
+            if (action == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("no.valid.agbot.attribute.specified")))
+            else db.run(action.transactionally.asTry.flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                logger.debug(s"PATCH /orgs/$orgid/agbots/$id result: $v")
+                if (v.asInstanceOf[Int] > 0) { // there were no db errors, but determine if it actually found it or not
+                  if (reqBody.token.isDefined) AuthCache.putAgbot(compositeId, hashedTok, reqBody.token.get) // We do not need to run putOwner because patch does not change the owner
+                  ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOT, ResChangeOperation.MODIFIED).insert.asTry
+                } else {
+                  DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("agbot.not.found", compositeId))).asTry
+                }
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug(s"PATCH /orgs/$orgid/agbots/$id updated in changes table: $v")
+                (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.attribute.updated", attrName, compositeId)))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.not.inserted.or.updated", compositeId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.not.inserted.or.updated", compositeId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/agbots/{id} ===============================
@@ -477,33 +488,36 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot")
   def agbotDeleteRoute: Route = (path("orgs" / Segment / "agbots" / Segment) & delete) { (orgid, id) =>
     logger.debug(s"Doing DELETE /orgs/$orgid/agbots/$id")
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      complete({
-        // remove does *not* throw an exception if the key does not exist
-        db.run(AgbotsTQ.getAgbot(compositeId).delete.transactionally.asTry.flatMap({
-          case Success(v) =>
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              logger.debug(s"DELETE /orgs/$orgid/agbots/$id result: $v")
-              AuthCache.removeAgbotAndOwner(compositeId)
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOT, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("agbot.not.found", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug(s"DELETE /orgs/$orgid/agbots/$id updated in changes table: $v")
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        complete({
+          // remove does *not* throw an exception if the key does not exist
+          db.run(AgbotsTQ.getAgbot(compositeId).delete.transactionally.asTry.flatMap({
+            case Success(v) =>
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                logger.debug(s"DELETE /orgs/$orgid/agbots/$id result: $v")
+                AuthCache.removeAgbotAndOwner(compositeId)
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOT, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("agbot.not.found", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug(s"DELETE /orgs/$orgid/agbots/$id updated in changes table: $v")
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/agbots/{id}/heartbeat ===============================
@@ -522,24 +536,27 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot")
   def agbotHeartbeatRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "heartbeat") & post) { (orgid, id) =>
     logger.debug(s"Doing POST /orgs/$orgid/users/$id/heartbeat")
-    val compositeId = OrgAndId(orgid, id).toString
-    exchAuth(TAgbot(compositeId),Access.WRITE) { _ =>
-      complete({
-        db.run(AgbotsTQ.getLastHeartbeat(compositeId).update(ApiTime.nowUTC).asTry).map({
-          case Success(v) =>
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              logger.debug(s"POST /orgs/$orgid/users/$id/heartbeat result: $v")
-              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.updated")))
-            } else {
-              (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agbot.not.found", compositeId)))
-            }
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.not.updated", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.not.updated", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid, id).toString
+      exchAuth(TAgbot(compositeId),Access.WRITE) { _ =>
+        complete({
+          db.run(AgbotsTQ.getLastHeartbeat(compositeId).update(ApiTime.nowUTC).asTry).map({
+            case Success(v) =>
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                logger.debug(s"POST /orgs/$orgid/users/$id/heartbeat result: $v")
+                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.updated")))
+              } else {
+                (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agbot.not.found", compositeId)))
+              }
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.not.updated", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.not.updated", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -587,17 +604,20 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/pattern")
   def agbotGetPatternsRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "patterns") & get) { (orgid, id) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(AgbotPatternsTQ.getPatterns(compositeId).result).map({ list =>
-          logger.debug(s"GET /orgs/$orgid/agbots/$id/patterns result size: ${list.size}")
-          val patterns = list.map(e => e.patId -> e.toAgbotPattern).toMap
-          val code = if (patterns.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-          (code, GetAgbotPatternsResponse(patterns))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId),Access.READ) { _ =>
+        complete({
+          db.run(AgbotPatternsTQ.getPatterns(compositeId).result).map({ list =>
+            logger.debug(s"GET /orgs/$orgid/agbots/$id/patterns result size: ${list.size}")
+            val patterns = list.map(e => e.patId -> e.toAgbotPattern).toMap
+            val code = if (patterns.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+            (code, GetAgbotPatternsResponse(patterns))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/agbots/{id}/patterns/{patid} ================================ */
@@ -637,17 +657,20 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/pattern")
   def agbotGetPatternRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "patterns" / Segment) & get) { (orgid, id, patId) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(AgbotPatternsTQ.getPattern(compositeId, patId).result).map({ list =>
-          logger.debug(s"GET /orgs/$orgid/agbots/$id/patterns/$patId result size: ${list.size}")
-          val patterns = list.map(e => e.patId -> e.toAgbotPattern).toMap
-          val code = if (patterns.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-          (code, GetAgbotPatternsResponse(patterns))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId),Access.READ) { _ =>
+        complete({
+          db.run(AgbotPatternsTQ.getPattern(compositeId, patId).result).map({ list =>
+            logger.debug(s"GET /orgs/$orgid/agbots/$id/patterns/$patId result size: ${list.size}")
+            val patterns = list.map(e => e.patId -> e.toAgbotPattern).toMap
+            val code = if (patterns.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+            (code, GetAgbotPatternsResponse(patterns))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/agbots/{id}/patterns ===============================
@@ -699,38 +722,41 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
           description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/pattern")
   def agbotPostPatRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "patterns") & post & entity(as[PostAgbotPatternRequest])) { (orgid, id, reqBody) =>
-    val compositeId = OrgAndId(orgid, id).toString
-    exchAuth(TAgbot(compositeId),Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          val patId = reqBody.formId
-          db.run(PatternsTQ.getPattern(OrgAndId(reqBody.patternOrgid,reqBody.pattern).toString).length.result.asTry.flatMap({
-            case Success(num) =>
-              logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/patterns pattern validation: " + num)
-              if (num > 0 || reqBody.pattern == "*") reqBody.toAgbotPatternRow(compositeId, patId).insert.asTry
-              else DBIO.failed(new Throwable(ExchMsg.translate("pattern.not.in.exchange"))).asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          }).flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/patterns result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTPATTERNS, ResChangeOperation.CREATED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/patterns updated in changes table: " + v)
-              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("pattern.added", patId)))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              if (ExchangePosgtresErrorHandling.isDuplicateKeyError(t)) (HttpCode.ALREADY_EXISTS2, ApiResponse(ApiRespType.ALREADY_EXISTS, ExchMsg.translate("pattern.foragbot.already.exists", patId, compositeId)))
-              else if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("pattern.not.inserted", patId, compositeId, t.getMessage)))
-              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("pattern.not.inserted", patId, compositeId, t.getServerErrorMessage))
-            case Failure(t) =>
-              if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("pattern.not.inserted", patId, compositeId, t.getMessage)))
-              else (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("pattern.not.inserted", patId, compositeId, t.getMessage)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid, id).toString
+      exchAuth(TAgbot(compositeId),Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            val patId = reqBody.formId
+            db.run(PatternsTQ.getPattern(OrgAndId(reqBody.patternOrgid,reqBody.pattern).toString).length.result.asTry.flatMap({
+              case Success(num) =>
+                logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/patterns pattern validation: " + num)
+                if (num > 0 || reqBody.pattern == "*") reqBody.toAgbotPatternRow(compositeId, patId).insert.asTry
+                else DBIO.failed(new Throwable(ExchMsg.translate("pattern.not.in.exchange"))).asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            }).flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/patterns result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTPATTERNS, ResChangeOperation.CREATED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/patterns updated in changes table: " + v)
+                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("pattern.added", patId)))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                if (ExchangePosgtresErrorHandling.isDuplicateKeyError(t)) (HttpCode.ALREADY_EXISTS2, ApiResponse(ApiRespType.ALREADY_EXISTS, ExchMsg.translate("pattern.foragbot.already.exists", patId, compositeId)))
+                else if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("pattern.not.inserted", patId, compositeId, t.getMessage)))
+                else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("pattern.not.inserted", patId, compositeId, t.getServerErrorMessage))
+              case Failure(t) =>
+                if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("pattern.not.inserted", patId, compositeId, t.getMessage)))
+                else (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("pattern.not.inserted", patId, compositeId, t.getMessage)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/agbots/{id}/patterns ===============================
@@ -747,33 +773,36 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/pattern")
   def agbotDeletePatsRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "patterns") & delete) { (orgid, id) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      complete({
-        // remove does *not* throw an exception if the key does not exist
-        db.run(AgbotPatternsTQ.getPatterns(compositeId).delete.asTry.flatMap({
-          case Success(v) =>
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              // Add the resource to the resourcechanges table
-              logger.debug("DELETE /agbots/" + id + "/patterns result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTPATTERNS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("patterns.not.found", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("DELETE /agbots/" + id + "/patterns updated in changes table: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("patterns.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("patterns.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("patterns.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        complete({
+          // remove does *not* throw an exception if the key does not exist
+          db.run(AgbotPatternsTQ.getPatterns(compositeId).delete.asTry.flatMap({
+            case Success(v) =>
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                // Add the resource to the resourcechanges table
+                logger.debug("DELETE /agbots/" + id + "/patterns result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTPATTERNS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("patterns.not.found", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("DELETE /agbots/" + id + "/patterns updated in changes table: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("patterns.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("patterns.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("patterns.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/agbots/{id}/patterns/{patid} ===============================
@@ -791,32 +820,35 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/pattern")
   def agbotDeletePatRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "patterns" / Segment) & delete) { (orgid, id, patId) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      complete({
-        db.run(AgbotPatternsTQ.getPattern(compositeId,patId).delete.asTry.flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("DELETE /agbots/" + id + "/patterns/" + patId + " result: " + v)
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTPATTERNS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("pattern.not.found", patId, compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("DELETE /agbots/" + id + "/patterns/" + patId + " updated in changes table: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.pattern.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("pattern.not.deleted", patId, compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("pattern.not.deleted", patId, compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        complete({
+          db.run(AgbotPatternsTQ.getPattern(compositeId,patId).delete.asTry.flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("DELETE /agbots/" + id + "/patterns/" + patId + " result: " + v)
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTPATTERNS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("pattern.not.found", patId, compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("DELETE /agbots/" + id + "/patterns/" + patId + " updated in changes table: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.pattern.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("pattern.not.deleted", patId, compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("pattern.not.deleted", patId, compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -857,17 +889,20 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/policy")
   def agbotGetBusPolsRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "businesspols") & get) { (orgid, id) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(AgbotBusinessPolsTQ.getBusinessPols(compositeId).result).map({ list =>
-          logger.debug(s"GET /orgs/$orgid/agbots/$id/businesspols result size: ${list.size}")
-          val businessPols = list.map(e => e.busPolId -> e.toAgbotBusinessPol).toMap
-          val code = if (businessPols.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-          (code, GetAgbotBusinessPolsResponse(businessPols))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId),Access.READ) { _ =>
+        complete({
+          db.run(AgbotBusinessPolsTQ.getBusinessPols(compositeId).result).map({ list =>
+            logger.debug(s"GET /orgs/$orgid/agbots/$id/businesspols result size: ${list.size}")
+            val businessPols = list.map(e => e.busPolId -> e.toAgbotBusinessPol).toMap
+            val code = if (businessPols.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+            (code, GetAgbotBusinessPolsResponse(businessPols))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/agbots/{id}/businesspols/{buspolid} ================================ */
@@ -906,17 +941,20 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/policy")
   def agbotGetBusPolRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "businesspols" / Segment) & get) { (orgid, id, busPolId) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(AgbotBusinessPolsTQ.getBusinessPol(compositeId, busPolId).result).map({ list =>
-          logger.debug(s"GET /orgs/$orgid/agbots/$id/businesspols/$busPolId result size: ${list.size}")
-          val businessPols = list.map(e => e.busPolId -> e.toAgbotBusinessPol).toMap
-          val code = if (businessPols.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-          (code, GetAgbotBusinessPolsResponse(businessPols))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId),Access.READ) { _ =>
+        complete({
+          db.run(AgbotBusinessPolsTQ.getBusinessPol(compositeId, busPolId).result).map({ list =>
+            logger.debug(s"GET /orgs/$orgid/agbots/$id/businesspols/$busPolId result size: ${list.size}")
+            val businessPols = list.map(e => e.busPolId -> e.toAgbotBusinessPol).toMap
+            val code = if (businessPols.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+            (code, GetAgbotBusinessPolsResponse(businessPols))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/agbots/{id}/businesspols ===============================
@@ -978,38 +1016,41 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/policy")
   def agbotPostBusPolRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "businesspols") & post & entity(as[PostAgbotBusinessPolRequest])) { (orgid, id, reqBody) =>
-    val compositeId = OrgAndId(orgid, id).toString
-    exchAuth(TAgbot(compositeId),Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          val patId = reqBody.formId
-          db.run(BusinessPoliciesTQ.getBusinessPolicy(OrgAndId(reqBody.businessPolOrgid,reqBody.businessPol).toString).length.result.asTry.flatMap({
-            case Success(num) =>
-              logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/businesspols business policy validation: " + num)
-              if (num > 0 || reqBody.businessPol == "*") reqBody.toAgbotBusinessPolRow(compositeId, patId).insert.asTry
-              else DBIO.failed(new Throwable(ExchMsg.translate("buspol.not.in.exchange"))).asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          }).flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/businesspols result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTBUSINESSPOLS, ResChangeOperation.CREATED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/businesspols updated in changes table: " + v)
-              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("buspol.added", patId)))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              if (ExchangePosgtresErrorHandling.isDuplicateKeyError(t)) (HttpCode.ALREADY_EXISTS2, ApiResponse(ApiRespType.ALREADY_EXISTS, ExchMsg.translate("buspol.foragbot.already.exists", patId, compositeId)))
-              else if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("buspol.not.inserted", patId, compositeId, t.getMessage)))
-              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("buspol.not.inserted", patId, compositeId, t.getServerErrorMessage))
-            case Failure(t) =>
-              if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("buspol.not.inserted", patId, compositeId, t.getMessage)))
-              else (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("buspol.not.inserted", patId, compositeId, t.getMessage)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid, id).toString
+      exchAuth(TAgbot(compositeId),Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            val patId = reqBody.formId
+            db.run(BusinessPoliciesTQ.getBusinessPolicy(OrgAndId(reqBody.businessPolOrgid,reqBody.businessPol).toString).length.result.asTry.flatMap({
+              case Success(num) =>
+                logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/businesspols business policy validation: " + num)
+                if (num > 0 || reqBody.businessPol == "*") reqBody.toAgbotBusinessPolRow(compositeId, patId).insert.asTry
+                else DBIO.failed(new Throwable(ExchMsg.translate("buspol.not.in.exchange"))).asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            }).flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/businesspols result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTBUSINESSPOLS, ResChangeOperation.CREATED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/businesspols updated in changes table: " + v)
+                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("buspol.added", patId)))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                if (ExchangePosgtresErrorHandling.isDuplicateKeyError(t)) (HttpCode.ALREADY_EXISTS2, ApiResponse(ApiRespType.ALREADY_EXISTS, ExchMsg.translate("buspol.foragbot.already.exists", patId, compositeId)))
+                else if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("buspol.not.inserted", patId, compositeId, t.getMessage)))
+                else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("buspol.not.inserted", patId, compositeId, t.getServerErrorMessage))
+              case Failure(t) =>
+                if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("buspol.not.inserted", patId, compositeId, t.getMessage)))
+                else (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("buspol.not.inserted", patId, compositeId, t.getMessage)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/agbots/{id}/businesspols ===============================
@@ -1026,33 +1067,36 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/policy")
   def agbotDeleteBusPolsRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "businesspols") & delete) { (orgid, id) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      complete({
-        // remove does *not* throw an exception if the key does not exist
-        db.run(AgbotBusinessPolsTQ.getBusinessPols(compositeId).delete.asTry.flatMap({
-          case Success(v) =>
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              // Add the resource to the resourcechanges table
-              logger.debug("DELETE /agbots/" + id + "/businesspols result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTBUSINESSPOLS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("buspols.not.found", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("DELETE /agbots/" + id + "/businesspols updated in changes table: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("buspols.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("buspols.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("buspols.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        complete({
+          // remove does *not* throw an exception if the key does not exist
+          db.run(AgbotBusinessPolsTQ.getBusinessPols(compositeId).delete.asTry.flatMap({
+            case Success(v) =>
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                // Add the resource to the resourcechanges table
+                logger.debug("DELETE /agbots/" + id + "/businesspols result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTBUSINESSPOLS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("buspols.not.found", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("DELETE /agbots/" + id + "/businesspols updated in changes table: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("buspols.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("buspols.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("buspols.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/agbots/{id}/businesspols/{buspolid} ===============================
@@ -1070,32 +1114,35 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/policy")
   def agbotDeleteBusPolRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "businesspols" / Segment) & delete) { (orgid, id, busPolId) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      complete({
-        db.run(AgbotBusinessPolsTQ.getBusinessPol(compositeId,busPolId).delete.asTry.flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("DELETE /agbots/" + id + "/businesspols/" + busPolId + " result: " + v)
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTBUSINESSPOLS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("buspol.not.found", busPolId, compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("DELETE /agbots/" + id + "/businesspols/" + busPolId + " updated in changes table: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("buspol.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("buspol.not.deleted", busPolId, compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("buspol.not.deleted", busPolId, compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        complete({
+          db.run(AgbotBusinessPolsTQ.getBusinessPol(compositeId,busPolId).delete.asTry.flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("DELETE /agbots/" + id + "/businesspols/" + busPolId + " result: " + v)
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTBUSINESSPOLS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("buspol.not.found", busPolId, compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("DELETE /agbots/" + id + "/businesspols/" + busPolId + " updated in changes table: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("buspol.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("buspol.not.deleted", busPolId, compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("buspol.not.deleted", busPolId, compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1142,17 +1189,20 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/agreement")
   def agbotGetAgreementsRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "agreements") & get) { (orgid, id) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(AgbotAgreementsTQ.getAgreements(compositeId).result).map({ list =>
-          logger.debug(s"GET /orgs/$orgid/agbots/$id/agreements result size: ${list.size}")
-          val agreements = list.map(e => e.agrId -> e.toAgbotAgreement).toMap
-          val code = if (agreements.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-          (code, GetAgbotAgreementsResponse(agreements, 0))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId),Access.READ) { _ =>
+        complete({
+          db.run(AgbotAgreementsTQ.getAgreements(compositeId).result).map({ list =>
+            logger.debug(s"GET /orgs/$orgid/agbots/$id/agreements result size: ${list.size}")
+            val agreements = list.map(e => e.agrId -> e.toAgbotAgreement).toMap
+            val code = if (agreements.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+            (code, GetAgbotAgreementsResponse(agreements, 0))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/agbots/{id}/agreements/{agid} ================================ */
@@ -1197,17 +1247,20 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/agreement")
   def agbotGetAgreementRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "agreements" / Segment) & get) { (orgid, id, agrId) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId),Access.READ) { _ =>
-      complete({
-        db.run(AgbotAgreementsTQ.getAgreement(compositeId, agrId).result).map({ list =>
-          logger.debug(s"GET /orgs/$orgid/agbots/$id/agreements/$agrId result size: ${list.size}")
-          val agreements = list.map(e => e.agrId -> e.toAgbotAgreement).toMap
-          val code = if (agreements.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-          (code, GetAgbotAgreementsResponse(agreements, 0))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId),Access.READ) { _ =>
+        complete({
+          db.run(AgbotAgreementsTQ.getAgreement(compositeId, agrId).result).map({ list =>
+            logger.debug(s"GET /orgs/$orgid/agbots/$id/agreements/$agrId result size: ${list.size}")
+            val agreements = list.map(e => e.agrId -> e.toAgbotAgreement).toMap
+            val code = if (agreements.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+            (code, GetAgbotAgreementsResponse(agreements, 0))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== PUT /orgs/{orgid}/agbots/{id}/agreements/{agid} ===============================
@@ -1277,38 +1330,41 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/agreement")
   def agbotPutAgreementRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "agreements" / Segment) & put & entity(as[PutAgbotAgreementRequest])) { (orgid, id, agrId, reqBody) =>
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
     val compositeId = OrgAndId(orgid, id).toString
     exchAuth(TAgbot(compositeId),Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          val maxAgreements = ExchConfig.getInt("api.limits.maxAgreements")
-          val getNumOwnedDbio = if (maxAgreements == 0) DBIO.successful(0) else AgbotAgreementsTQ.getNumOwned(compositeId).result // avoid DB read for this if there is no max
-          db.run(getNumOwnedDbio.flatMap({ xs =>
-            if (maxAgreements != 0) logger.debug("PUT /orgs/"+orgid+"/agbots/"+id+"/agreements/"+agrId+" num owned: "+xs)
-            val numOwned = xs
-            // we are not sure if this is create or update, but if they are already over the limit, stop them anyway
-            if (maxAgreements == 0 || numOwned <= maxAgreements) reqBody.toAgbotAgreementRow(compositeId, agrId).upsert.asTry
-            else DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.max.limit.of.agreements", maxAgreements) )).asTry
-          }).flatMap({
-            case Success(v) =>
-              // Add the resource to the resourcechanges table
-              logger.debug("PUT /orgs/" + orgid + "/agbots/" + id + "/agreements/" + agrId + " result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTAGREEMENTS, ResChangeOperation.CREATEDMODIFIED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug("PUT /orgs/" + orgid + "/agbots/" + id + "/agreements/" + agrId + " updated in changes table: " + v)
-              (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agreement.added.or.updated")))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agreement.not.inserted.or.updated", agrId, compositeId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agreement.not.inserted.or.updated", agrId, compositeId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            val maxAgreements = ExchConfig.getInt("api.limits.maxAgreements")
+            val getNumOwnedDbio = if (maxAgreements == 0) DBIO.successful(0) else AgbotAgreementsTQ.getNumOwned(compositeId).result // avoid DB read for this if there is no max
+            db.run(getNumOwnedDbio.flatMap({ xs =>
+              if (maxAgreements != 0) logger.debug("PUT /orgs/"+orgid+"/agbots/"+id+"/agreements/"+agrId+" num owned: "+xs)
+              val numOwned = xs
+              // we are not sure if this is create or update, but if they are already over the limit, stop them anyway
+              if (maxAgreements == 0 || numOwned <= maxAgreements) reqBody.toAgbotAgreementRow(compositeId, agrId).upsert.asTry
+              else DBIO.failed(new DBProcessingError(HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("over.max.limit.of.agreements", maxAgreements) )).asTry
+            }).flatMap({
+              case Success(v) =>
+                // Add the resource to the resourcechanges table
+                logger.debug("PUT /orgs/" + orgid + "/agbots/" + id + "/agreements/" + agrId + " result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTAGREEMENTS, ResChangeOperation.CREATEDMODIFIED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug("PUT /orgs/" + orgid + "/agbots/" + id + "/agreements/" + agrId + " updated in changes table: " + v)
+                (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agreement.added.or.updated")))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agreement.not.inserted.or.updated", agrId, compositeId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agreement.not.inserted.or.updated", agrId, compositeId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/agbots/{id}/agreements ===============================
@@ -1325,33 +1381,36 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/agreement")
   def agbotDeleteAgreementsRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "agreements") & delete) { (orgid, id) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      complete({
-        // remove does *not* throw an exception if the key does not exist
-        db.run(AgbotAgreementsTQ.getAgreements(compositeId).delete.asTry.flatMap({
-          case Success(v) =>
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              // Add the resource to the resourcechanges table
-              logger.debug("DELETE /agbots/" + id + "/agreements result: " + v)
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTAGREEMENTS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("no.agreements.found.for.agbot", compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("DELETE /agbots/" + id + "/agreements updated in changes table: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.agreements.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.agreements.not.deleted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.agreements.not.deleted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        complete({
+          // remove does *not* throw an exception if the key does not exist
+          db.run(AgbotAgreementsTQ.getAgreements(compositeId).delete.asTry.flatMap({
+            case Success(v) =>
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                // Add the resource to the resourcechanges table
+                logger.debug("DELETE /agbots/" + id + "/agreements result: " + v)
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTAGREEMENTS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("no.agreements.found.for.agbot", compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("DELETE /agbots/" + id + "/agreements updated in changes table: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.agreements.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.agreements.not.deleted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.agreements.not.deleted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/agbots/{id}/agreements/{agid} ===============================
@@ -1369,32 +1428,35 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/agreement")
   def agbotDeleteAgreementRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "agreements" / Segment) & delete) { (orgid, id, agrId) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      complete({
-        db.run(AgbotAgreementsTQ.getAgreement(compositeId,agrId).delete.asTry.flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("DELETE /agbots/" + id + "/agreements/" + agrId + " result: " + v)
-            if (v > 0) { // there were no db errors, but determine if it actually found it or not
-              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTAGREEMENTS, ResChangeOperation.DELETED).insert.asTry
-            } else {
-              DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("agreement.for.agbot.not.found", agrId, compositeId))).asTry
-            }
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("DELETE /agbots/" + id + "/agreements/" + agrId + " updated in changes table: " + v)
-            (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.agreement.deleted")))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agreement.for.agbot.not.deleted", agrId, compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agreement.for.agbot.not.deleted", agrId, compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        complete({
+          db.run(AgbotAgreementsTQ.getAgreement(compositeId,agrId).delete.asTry.flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("DELETE /agbots/" + id + "/agreements/" + agrId + " result: " + v)
+              if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTAGREEMENTS, ResChangeOperation.DELETED).insert.asTry
+              } else {
+                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("agreement.for.agbot.not.found", agrId, compositeId))).asTry
+              }
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("DELETE /agbots/" + id + "/agreements/" + agrId + " updated in changes table: " + v)
+              (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.agreement.deleted")))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agreement.for.agbot.not.deleted", agrId, compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agreement.for.agbot.not.deleted", agrId, compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/agbots/{id}/msgs ===============================
@@ -1455,48 +1517,51 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   )
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/message")
   def agbotPostMsgRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "msgs") & post & entity(as[PostAgbotsMsgsRequest])) { (orgid, id, reqBody) =>
-    val compositeId = OrgAndId(orgid, id).toString
-    exchAuth(TAgbot(compositeId),Access.SEND_MSG_TO_AGBOT) { ident =>
-      complete({
-        val nodeId = ident.creds.id      //somday: handle the case where the acls allow users to send msgs
-        var msgNum = ""
-        val maxMessagesInMailbox = ExchConfig.getInt("api.limits.maxMessagesInMailbox")
-        val getNumOwnedDbio = if (maxMessagesInMailbox == 0) DBIO.successful(0) else AgbotMsgsTQ.getNumOwned(compositeId).result // avoid DB read for this if there is no max
-        // Remove msgs whose TTL is past, then check the mailbox is not full, then get the node publicKey, then write the agbotmsgs row, all in the same db.run thread
-        db.run(getNumOwnedDbio.flatMap({ xs =>
-          if (maxMessagesInMailbox != 0) logger.debug("POST /orgs/"+orgid+"/agbots/"+id+"/msgs mailbox size: "+xs)
-          val mailboxSize = xs
-          if (maxMessagesInMailbox == 0 || mailboxSize < maxMessagesInMailbox) NodesTQ.getPublicKey(nodeId).result.asTry
-          else DBIO.failed(new DBProcessingError(HttpCode.BAD_GW, ApiRespType.BAD_GW, ExchMsg.translate("agbot.mailbox.full", compositeId, maxMessagesInMailbox) )).asTry
-        }).flatMap({
-          case Success(v) =>
-            logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/msgs node publickey result: " + v)
-            val nodePubKey = v.head
-            if (nodePubKey != "") AgbotMsgRow(0, compositeId, nodeId, nodePubKey, reqBody.message, ApiTime.nowUTC, ApiTime.futureUTC(reqBody.ttl)).insert.asTry
-            else DBIO.failed(new DBProcessingError(HttpCode.BAD_INPUT, ApiRespType.BAD_INPUT, ExchMsg.translate("agbot.message.invalid.input"))).asTry
-          case Failure(t) =>
-            DBIO.failed(t).asTry // rethrow the error to the next step
-        }).flatMap({
-          case Success(v) =>
-            // Add the resource to the resourcechanges table
-            logger.debug("POST /orgs/{orgid}/agbots/" + id + "/msgs write row result: " + v)
-            msgNum = v.toString
-            ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTMSGS, ResChangeOperation.CREATED).insert.asTry
-          case Failure(t) => DBIO.failed(t).asTry
-        })).map({
-          case Success(v) =>
-            logger.debug("POST /orgs/{orgid}/agbots/" + id + "/msgs updated in changes table: " + v)
-            (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, "agbot msg " + msgNum + " inserted"))
-          case Failure(t: DBProcessingError) =>
-            t.toComplete
-          case Failure(t: org.postgresql.util.PSQLException) =>
-            if (ExchangePosgtresErrorHandling.isKeyNotFoundError(t)) (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agbot.message.agbotid.not.found", compositeId, t.getMessage)))
-            else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.message.not.inserted", compositeId, t.toString))
-          case Failure(t) =>
-            (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.message.not.inserted", compositeId, t.toString)))
-        })
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid, id).toString
+      exchAuth(TAgbot(compositeId),Access.SEND_MSG_TO_AGBOT) { ident =>
+        complete({
+          val nodeId = ident.creds.id      //somday: handle the case where the acls allow users to send msgs
+          var msgNum = ""
+          val maxMessagesInMailbox = ExchConfig.getInt("api.limits.maxMessagesInMailbox")
+          val getNumOwnedDbio = if (maxMessagesInMailbox == 0) DBIO.successful(0) else AgbotMsgsTQ.getNumOwned(compositeId).result // avoid DB read for this if there is no max
+          // Remove msgs whose TTL is past, then check the mailbox is not full, then get the node publicKey, then write the agbotmsgs row, all in the same db.run thread
+          db.run(getNumOwnedDbio.flatMap({ xs =>
+            if (maxMessagesInMailbox != 0) logger.debug("POST /orgs/"+orgid+"/agbots/"+id+"/msgs mailbox size: "+xs)
+            val mailboxSize = xs
+            if (maxMessagesInMailbox == 0 || mailboxSize < maxMessagesInMailbox) NodesTQ.getPublicKey(nodeId).result.asTry
+            else DBIO.failed(new DBProcessingError(HttpCode.BAD_GW, ApiRespType.BAD_GW, ExchMsg.translate("agbot.mailbox.full", compositeId, maxMessagesInMailbox) )).asTry
+          }).flatMap({
+            case Success(v) =>
+              logger.debug("POST /orgs/" + orgid + "/agbots/" + id + "/msgs node publickey result: " + v)
+              val nodePubKey = v.head
+              if (nodePubKey != "") AgbotMsgRow(0, compositeId, nodeId, nodePubKey, reqBody.message, ApiTime.nowUTC, ApiTime.futureUTC(reqBody.ttl)).insert.asTry
+              else DBIO.failed(new DBProcessingError(HttpCode.BAD_INPUT, ApiRespType.BAD_INPUT, ExchMsg.translate("agbot.message.invalid.input"))).asTry
+            case Failure(t) =>
+              DBIO.failed(t).asTry // rethrow the error to the next step
+          }).flatMap({
+            case Success(v) =>
+              // Add the resource to the resourcechanges table
+              logger.debug("POST /orgs/{orgid}/agbots/" + id + "/msgs write row result: " + v)
+              msgNum = v.toString
+              ResourceChange(0L, orgid, id, ResChangeCategory.AGBOT, false, ResChangeResource.AGBOTMSGS, ResChangeOperation.CREATED).insert.asTry
+            case Failure(t) => DBIO.failed(t).asTry
+          })).map({
+            case Success(v) =>
+              logger.debug("POST /orgs/{orgid}/agbots/" + id + "/msgs updated in changes table: " + v)
+              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, "agbot msg " + msgNum + " inserted"))
+            case Failure(t: DBProcessingError) =>
+              t.toComplete
+            case Failure(t: org.postgresql.util.PSQLException) =>
+              if (ExchangePosgtresErrorHandling.isKeyNotFoundError(t)) (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agbot.message.agbotid.not.found", compositeId, t.getMessage)))
+              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.message.not.inserted", compositeId, t.toString))
+            case Failure(t) =>
+              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.message.not.inserted", compositeId, t.toString)))
+          })
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   /* ====== GET /orgs/{orgid}/agbots/{id}/msgs ================================ */
@@ -1517,25 +1582,28 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/message")
   def agbotGetMsgsRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "msgs") & get & parameter((Symbol("maxmsgs").?))) { (orgid, id, maxmsgsStrOpt) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId),Access.READ) { _ =>
-      validate(Try(maxmsgsStrOpt.map(_.toInt)).isSuccess, ExchMsg.translate("invalid.int.for.name", maxmsgsStrOpt.getOrElse(""), "maxmsgs")) {
-        complete({
-          // Set the query, including maxmsgs
-          var maxIntOpt = maxmsgsStrOpt.map(_.toInt)
-          var query = AgbotMsgsTQ.getMsgs(compositeId).sortBy(_.msgId)
-          if (maxIntOpt.getOrElse(0) > 0) query = query.take(maxIntOpt.get)
-          // Get the msgs for this agbot
-          db.run(query.result).map({ list =>
-            logger.debug("GET /orgs/"+orgid+"/agbots/"+id+"/msgs result size: "+list.size)
-            //logger.debug("GET /orgs/"+orgid+"/agbots/"+id+"/msgs result: "+list.toString)
-            val msgs = list.map(_.toAgbotMsg).toList
-            val code = if (msgs.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-            (code, GetAgbotMsgsResponse(msgs, 0))
-          })
-        }) // end of complete
-      }
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId),Access.READ) { _ =>
+        validate(Try(maxmsgsStrOpt.map(_.toInt)).isSuccess, ExchMsg.translate("invalid.int.for.name", maxmsgsStrOpt.getOrElse(""), "maxmsgs")) {
+          complete({
+            // Set the query, including maxmsgs
+            var maxIntOpt = maxmsgsStrOpt.map(_.toInt)
+            var query = AgbotMsgsTQ.getMsgs(compositeId).sortBy(_.msgId)
+            if (maxIntOpt.getOrElse(0) > 0) query = query.take(maxIntOpt.get)
+            // Get the msgs for this agbot
+            db.run(query.result).map({ list =>
+              logger.debug("GET /orgs/"+orgid+"/agbots/"+id+"/msgs result size: "+list.size)
+              //logger.debug("GET /orgs/"+orgid+"/agbots/"+id+"/msgs result: "+list.toString)
+              val msgs = list.map(_.toAgbotMsg).toList
+              val code = if (msgs.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+              (code, GetAgbotMsgsResponse(msgs, 0))
+            })
+          }) // end of complete
+        }
+      } // end of exchAuth
+    }
   }
   
   /* ====== GET /orgs/{orgid}/agbots/{id}/msgs/{msgid} ================================ */
@@ -1569,40 +1637,43 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/message")
   def agbotGetMsgRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "msgs" / Segment) & get) {
     (orgid, id, msgid) =>
-      val compositeId = OrgAndId(orgid, id).toString
-      logger.debug("msgid.toInt: " + msgid.toInt)
-      
-      exchAuth(TAgbot(compositeId), Access.READ) {
-        _ =>
-          complete({
-            db.run(
-              AgbotMsgsTQ.getMsg(agbotId = compositeId,
-                                 msgId = msgid.toInt)
-                         .result
-                         .map(
-                           result =>
-                             GetAgbotMsgsResponse(lastIndex = 0,
-                                                  messages = result.map(
-                                                               message =>
-                                                                 AgbotMsg(message = message.message,
-                                                                          msgId = message.msgId,
-                                                                          nodeId = message.nodeId,
-                                                                          nodePubKey = message.nodePubKey,
-                                                                          timeExpires = message.timeExpires,
-                                                                          timeSent = message.timeSent)).toList))
-                         .asTry
-              )
-              .map({
-                case Success(message) =>
-                  if(message.messages.nonEmpty)
-                    (HttpCode.OK, message)
-                  else
-                    (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
-                case Failure(t) =>
-                  (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.message", t.getMessage)))
-              })
-          }) // end of complete
-      } // end of exchAuth
+      selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+        val compositeId = OrgAndId(orgid, id).toString
+        logger.debug("msgid.toInt: " + msgid.toInt)
+
+        exchAuth(TAgbot(compositeId), Access.READ) {
+          _ =>
+            complete({
+              db.run(
+                AgbotMsgsTQ.getMsg(agbotId = compositeId,
+                                  msgId = msgid.toInt)
+                          .result
+                          .map(
+                            result =>
+                              GetAgbotMsgsResponse(lastIndex = 0,
+                                                    messages = result.map(
+                                                                message =>
+                                                                  AgbotMsg(message = message.message,
+                                                                            msgId = message.msgId,
+                                                                            nodeId = message.nodeId,
+                                                                            nodePubKey = message.nodePubKey,
+                                                                            timeExpires = message.timeExpires,
+                                                                            timeSent = message.timeSent)).toList))
+                          .asTry
+                )
+                .map({
+                  case Success(message) =>
+                    if(message.messages.nonEmpty)
+                      (HttpCode.OK, message)
+                    else
+                      (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("not.found")))
+                  case Failure(t) =>
+                    (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.message", t.getMessage)))
+                })
+            }) // end of complete
+        } // end of exchAuth
+      }
   }
 
   // =========== DELETE /orgs/{orgid}/agbots/{id}/msgs/{msgid} ===============================
@@ -1620,25 +1691,28 @@ trait AgbotsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   @io.swagger.v3.oas.annotations.tags.Tag(name = "agreement-bot/message")
   def agbotDeleteMsgRoute: Route = (path("orgs" / Segment / "agbots" / Segment / "msgs" / Segment) & delete) { (orgid, id, msgIdStr) =>
-    val compositeId = OrgAndId(orgid,id).toString
-    exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
-      complete({
-        try {
-          val msgId =  msgIdStr.toInt   // this can throw an exception, that's why this whole section is in a try/catch
-          db.run(AgbotMsgsTQ.getMsg(compositeId,msgId).delete.asTry).map({
-            case Success(v) =>
-              logger.debug("DELETE /agbots/" + id + "/msgs/" + msgId + " updated in changes table: " + v)
-              (HttpCode.DELETED,  ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.message.deleted")))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.message.not.deleted", msgId, compositeId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.message.not.deleted", msgId, compositeId, t.toString)))
-          })
-        } catch { case e: Exception => (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("msgid.must.be.int", e))) }    // the specific exception is NumberFormatException
-      }) // end of complete
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*){ lang =>
+      implicit val acceptLang: Language = lang
+      val compositeId = OrgAndId(orgid,id).toString
+      exchAuth(TAgbot(compositeId), Access.WRITE) { _ =>
+        complete({
+          try {
+            val msgId =  msgIdStr.toInt   // this can throw an exception, that's why this whole section is in a try/catch
+            db.run(AgbotMsgsTQ.getMsg(compositeId,msgId).delete.asTry).map({
+              case Success(v) =>
+                logger.debug("DELETE /agbots/" + id + "/msgs/" + msgId + " updated in changes table: " + v)
+                (HttpCode.DELETED,  ApiResponse(ApiRespType.OK, ExchMsg.translate("agbot.message.deleted")))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("agbot.message.not.deleted", msgId, compositeId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("agbot.message.not.deleted", msgId, compositeId, t.toString)))
+            })
+          } catch { case e: Exception => (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("msgid.must.be.int", e))) }    // the specific exception is NumberFormatException
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
 }

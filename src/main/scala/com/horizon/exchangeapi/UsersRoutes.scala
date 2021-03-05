@@ -24,6 +24,7 @@ import scala.concurrent.ExecutionContext
 import scala.util._
 
 import slick.jdbc.PostgresProfile.api._
+import akka.http.scaladsl.model.headers.Language
 
 
 //====== These are the input and output structures for /users routes. Swagger and/or json seem to require they be outside the trait.
@@ -34,7 +35,8 @@ final case class GetUsersResponse(users: Map[String, User], lastIndex: Int)
 /** Input format for PUT /users/<username> */
 final case class PostPutUsersRequest(password: String, admin: Boolean, hubAdmin: Option[Boolean], email: String) {
   require(password!=null && email!=null)
-  def getAnyProblem(ident: Identity, orgid: String, compositeId: String, isPost: Boolean): Option[String] = {
+  
+  def getAnyProblem(ident: Identity, orgid: String, compositeId: String, isPost: Boolean)(implicit acceptLang: Language): Option[String] = {
     // Note: AuthorizationSupport.IUser does some permission checking for this route, but it can't make decisions based on the request body content,
     //        so we have to do those checks here. For example, non-root trying to create/modify root is caught there.
     // Also Note: AuthCache methods can't be used here because they aren't always up to date on every exchange instance.
@@ -56,7 +58,8 @@ final case class PostPutUsersRequest(password: String, admin: Boolean, hubAdmin:
 
 final case class PatchUsersRequest(password: Option[String], admin: Option[Boolean], hubAdmin: Option[Boolean], email: Option[String]) {
   protected implicit val jsonFormats: Formats = DefaultFormats
-  def getAnyProblem(ident: Identity, orgid: String, compositeId: String): Option[String] = {
+  
+  def getAnyProblem(ident: Identity, orgid: String, compositeId: String)(implicit acceptLang: Language): Option[String] = {
     // Note: AuthorizationSupport.IUser does some permission checking for this route, but it can't make decisions based on the request body content,
     //        so we have to do those checks here. For example, non-root trying to create/modify root is caught there.
     // Also Note: AuthCache methods can't be used here because they aren't always up to date on every exchange instance.
@@ -96,7 +99,8 @@ final case class PatchUsersRequest(password: Option[String], admin: Option[Boole
 /** Input body for POST /orgs/{orgid}/users/{username}/changepw */
 final case class ChangePwRequest(newPassword: String) {
   require(newPassword!=null)
-  def getAnyProblem: Option[String] = {
+  
+  def getAnyProblem(implicit acceptLang: Language): Option[String] = {
     if (newPassword == "") Some(ExchMsg.translate("password.cannot.be.set.to.empty.string"))
     else None // None means no problems with input
   }
@@ -164,6 +168,7 @@ trait UsersRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def usersGetRoute: Route = (path("orgs" / Segment / "users") & get) { (orgid) =>
     logger.debug(s"Doing GET /orgs/$orgid/users")
+    
     exchAuth(TUser(OrgAndId(orgid, "#").toString), Access.READ) { ident =>
       complete({
         logger.debug(s"GET /orgs/$orgid/users identity: ${ident.creds.id}") // can't display the whole ident object, because that contains the pw/token
@@ -216,6 +221,7 @@ trait UsersRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def userGetRoute: Route = (path("orgs" / Segment / "users" / Segment) & get) { (orgid, username) =>
     logger.debug(s"Doing GET /orgs/$orgid/users/$username")
+    
     var compositeId: String = OrgAndId(orgid, username).toString
     exchAuth(TUser(compositeId), Access.READ) { ident =>
       complete({
@@ -300,31 +306,39 @@ trait UsersRoutes extends JacksonSupport with AuthenticationSupport {
   )
   def userPostRoute: Route = (path("orgs" / Segment / "users" / Segment) & post & entity(as[PostPutUsersRequest])) { (orgid, username, reqBody) =>
     logger.debug(s"Doing POST /orgs/$orgid/users/$username")
+    
     val compositeId: String = OrgAndId(orgid, username).toString
-    exchAuth(TUser(compositeId), Access.CREATE) { ident =>
-      logger.debug("isAdmin: " + ident.isAdmin + ", isHubAdmin: " + ident.isHubAdmin + ", isSuperUser: " + ident.isSuperUser)
-      validateWithMsg(reqBody.getAnyProblem(ident, orgid, compositeId, true)) {
-        complete({
-          val updatedBy: String = ident match { case IUser(identCreds) => identCreds.id; case _ => "" }
-          val hashedPw: String = Password.hash(reqBody.password)
-          /* Note: this kind of check and error msg in the body of complete({}) does not work (it returns the error msg, but the response code is still 200). This kind of access check belongs in AuthorizationSupport (which is invoked by exchAuth()) or in getAnyProblem().
+
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TUser(compositeId), Access.CREATE) { ident =>
+        logger.debug("isAdmin: " + ident.isAdmin + ", isHubAdmin: " + ident.isHubAdmin + ", isSuperUser: " + ident.isSuperUser)
+        validateWithMsg(reqBody.getAnyProblem(ident, orgid, compositeId, true)) {
+          complete({
+            val updatedBy: String = ident match {
+              case IUser(identCreds) => identCreds.id;
+              case _ => ""
+            }
+            val hashedPw: String = Password.hash(reqBody.password)
+            /* Note: this kind of check and error msg in the body of complete({}) does not work (it returns the error msg, but the response code is still 200). This kind of access check belongs in AuthorizationSupport (which is invoked by exchAuth()) or in getAnyProblem().
           if (ident.isHubAdmin && !ident.isSuperUser && !hubAdmin.getOrElse(false) && !admin) (HttpCode.ACCESS_DENIED, ApiRespType.ACCESS_DENIED, ExchMsg.translate("hub.admins.only.write.admins"))
           else */
-          db.run(UserRow(compositeId, orgid, hashedPw, reqBody.admin, reqBody.hubAdmin.getOrElse(false), reqBody.email, ApiTime.nowUTC, updatedBy).insertUser().asTry).map({
-            case Success(v) =>
-              logger.debug("POST /orgs/" + orgid + "/users/" + username + " result: " + v)
-              AuthCache.putUserAndIsAdmin(compositeId, hashedPw, reqBody.password, reqBody.admin)
-              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("user.added.successfully", v)))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              if (ExchangePosgtresErrorHandling.isDuplicateKeyError(t)) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.not.added", t.toString)))
-              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.not.added", t.toString))
-            case Failure(t: BadInputException) => t.toComplete
-            case Failure(t) =>
-              (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.not.added", t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+            db.run(UserRow(compositeId, orgid, hashedPw, reqBody.admin, reqBody.hubAdmin.getOrElse(false), reqBody.email, ApiTime.nowUTC, updatedBy).insertUser().asTry).map({
+              case Success(v) =>
+                logger.debug("POST /orgs/" + orgid + "/users/" + username + " result: " + v)
+                AuthCache.putUserAndIsAdmin(compositeId, hashedPw, reqBody.password, reqBody.admin)
+                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("user.added.successfully", v)))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                if (ExchangePosgtresErrorHandling.isDuplicateKeyError(t)) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.not.added", t.toString)))
+                else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.not.added", t.toString))
+              case Failure(t: BadInputException) => t.toComplete
+              case Failure(t) =>
+                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.not.added", t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== PUT /orgs/{orgid}/users/{username} ===============================
@@ -359,29 +373,37 @@ trait UsersRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def userPutRoute: Route = (path("orgs" / Segment / "users" / Segment) & put & entity(as[PostPutUsersRequest])) { (orgid, username, reqBody) =>
     logger.debug(s"Doing PUT /orgs/$orgid/users/$username")
+    
     val compositeId: String = OrgAndId(orgid, username).toString
-    exchAuth(TUser(compositeId), Access.WRITE) { ident =>
-      validateWithMsg(reqBody.getAnyProblem(ident, orgid, compositeId, false)) {
-        complete({
-          val updatedBy: String = ident match { case IUser(identCreds) => identCreds.id; case _ => "" }
-          val hashedPw: String = Password.hash(reqBody.password)
-          db.run(UserRow(compositeId, orgid, hashedPw, reqBody.admin, reqBody.hubAdmin.getOrElse(false), reqBody.email, ApiTime.nowUTC, updatedBy).updateUser().asTry).map({
-            case Success(n) =>
-              logger.debug("PUT /orgs/" + orgid + "/users/" + username + " result: " + n)
-              if (n.asInstanceOf[Int] > 0) {
-                AuthCache.putUserAndIsAdmin(compositeId, hashedPw, reqBody.password, reqBody.admin)
-                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("user.updated.successfully")))
-              } else {
-                (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("user.not.found", compositeId)))
-              }
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.not.updated", t.toString))
-            case Failure(t) =>
-              (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.not.updated", t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TUser(compositeId), Access.WRITE) { ident =>
+        validateWithMsg(reqBody.getAnyProblem(ident, orgid, compositeId, false)) {
+          complete({
+            val updatedBy: String = ident match {
+              case IUser(identCreds) => identCreds.id;
+              case _ => ""
+            }
+            val hashedPw: String = Password.hash(reqBody.password)
+            db.run(UserRow(compositeId, orgid, hashedPw, reqBody.admin, reqBody.hubAdmin.getOrElse(false), reqBody.email, ApiTime.nowUTC, updatedBy).updateUser().asTry).map({
+              case Success(n) =>
+                logger.debug("PUT /orgs/" + orgid + "/users/" + username + " result: " + n)
+                if (n.asInstanceOf[Int] > 0) {
+                  AuthCache.putUserAndIsAdmin(compositeId, hashedPw, reqBody.password, reqBody.admin)
+                  (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("user.updated.successfully")))
+                } else {
+                  (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("user.not.found", compositeId)))
+                }
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.not.updated", t.toString))
+              case Failure(t) =>
+                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.not.updated", t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== PATCH /orgs/{orgid}/users/{username} ===============================
@@ -416,32 +438,40 @@ trait UsersRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def userPatchRoute: Route = (path("orgs" / Segment / "users" / Segment) & patch & entity(as[PatchUsersRequest])) { (orgid, username, reqBody) =>
     logger.debug(s"Doing POST /orgs/$orgid/users/$username")
+    
     val compositeId: String = OrgAndId(orgid, username).toString
-    exchAuth(TUser(compositeId), Access.WRITE) { ident =>
-      validateWithMsg(reqBody.getAnyProblem(ident, orgid, compositeId)) {
-        complete({
-          val updatedBy: String = ident match { case IUser(identCreds) => identCreds.id; case _ => "" }
-          val hashedPw: String = if (reqBody.password.isDefined) Password.hash(reqBody.password.get) else "" // hash the pw if that is what is being updated
-          val (action, attrName) = reqBody.getDbUpdate(compositeId, orgid, updatedBy, hashedPw)
-          if (action == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("no.valid.agbot.attr.specified")))
-          db.run(action.transactionally.asTry).map({
-            case Success(n) =>
-              logger.debug("PATCH /orgs/" + orgid + "/users/" + username + " result: " + n)
-              if (n.asInstanceOf[Int] > 0) {
-                if (reqBody.password.isDefined) AuthCache.putUser(compositeId, hashedPw, reqBody.password.get)
-                if (reqBody.admin.isDefined) AuthCache.putUserIsAdmin(compositeId, reqBody.admin.get)
-                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("user.attr.updated", attrName, compositeId)))
-              } else {
-                (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("user.not.found", compositeId)))
-              }
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.not.updated", t.toString))
-            case Failure(t) =>
-              (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.not.updated", t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TUser(compositeId), Access.WRITE) { ident =>
+        validateWithMsg(reqBody.getAnyProblem(ident, orgid, compositeId)) {
+          complete({
+            val updatedBy: String = ident match {
+              case IUser(identCreds) => identCreds.id;
+              case _ => ""
+            }
+            val hashedPw: String = if (reqBody.password.isDefined) Password.hash(reqBody.password.get) else "" // hash the pw if that is what is being updated
+            val (action, attrName) = reqBody.getDbUpdate(compositeId, orgid, updatedBy, hashedPw)
+            if (action == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("no.valid.agbot.attr.specified")))
+            db.run(action.transactionally.asTry).map({
+              case Success(n) =>
+                logger.debug("PATCH /orgs/" + orgid + "/users/" + username + " result: " + n)
+                if (n.asInstanceOf[Int] > 0) {
+                  if (reqBody.password.isDefined) AuthCache.putUser(compositeId, hashedPw, reqBody.password.get)
+                  if (reqBody.admin.isDefined) AuthCache.putUserIsAdmin(compositeId, reqBody.admin.get)
+                  (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("user.attr.updated", attrName, compositeId)))
+                } else {
+                  (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("user.not.found", compositeId)))
+                }
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.not.updated", t.toString))
+              case Failure(t) =>
+                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.not.updated", t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // =========== DELETE /orgs/{orgid}/users/{username} ===============================
@@ -458,28 +488,32 @@ trait UsersRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def userDeleteRoute: Route = (path("orgs" / Segment / "users" / Segment) & delete) { (orgid, username) =>
     logger.debug(s"Doing DELETE /orgs/$orgid/users/$username")
+    
     val compositeId: String = OrgAndId(orgid, username).toString
-    exchAuth(TUser(compositeId), Access.WRITE) { ident =>
-      validate(orgid+"/"+username != Role.superUser, ExchMsg.translate("cannot.delete.root.user")) {
-        complete({
-          // Note: remove does *not* throw an exception if the key does not exist
-          //todo: if ident.isHubAdmin then 1st get the target user row to verify it isn't a regular user
-          db.run(UsersTQ.getUser(compositeId).delete.transactionally.asTry).map({
-            case Success(v) => // there were no db errors, but determine if it actually found it or not
-              logger.debug(s"DELETE /orgs/$orgid/users/$username result: $v")
-              if (v > 0) {
-                AuthCache.removeUser(compositeId) // these do not throw an error if the user doesn't exist
-                //IbmCloudAuth.removeUserKey(compositeId) //todo: <- doesn't work because the IAM cache key includes the api key, which we don't know at this point. Address this in https://github.com/open-horizon/exchange-api/issues/232
-                (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("user.deleted")))
-              } else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("user.not.found", compositeId)))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.not.deleted", compositeId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("user.not.deleted", compositeId, t.toString)))
-          })
-        }) // end of complete
-      }
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TUser(compositeId), Access.WRITE) { ident =>
+        validate(orgid + "/" + username != Role.superUser, ExchMsg.translate("cannot.delete.root.user")) {
+          complete({
+            // Note: remove does *not* throw an exception if the key does not exist
+            //todo: if ident.isHubAdmin then 1st get the target user row to verify it isn't a regular user
+            db.run(UsersTQ.getUser(compositeId).delete.transactionally.asTry).map({
+              case Success(v) => // there were no db errors, but determine if it actually found it or not
+                logger.debug(s"DELETE /orgs/$orgid/users/$username result: $v")
+                if (v > 0) {
+                  AuthCache.removeUser(compositeId) // these do not throw an error if the user doesn't exist
+                  //IbmCloudAuth.removeUserKey(compositeId) //todo: <- doesn't work because the IAM cache key includes the api key, which we don't know at this point. Address this in https://github.com/open-horizon/exchange-api/issues/232
+                  (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("user.deleted")))
+                } else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("user.not.found", compositeId)))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.not.deleted", compositeId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("user.not.deleted", compositeId, t.toString)))
+            })
+          }) // end of complete
+        }
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/users/{username}/confirm ===============================
@@ -496,13 +530,18 @@ trait UsersRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def userConfirmRoute: Route = (path("orgs" / Segment / "users" / Segment / "confirm") & post) { (orgid, username) =>
     logger.debug(s"Doing POST /orgs/$orgid/users/$username/confirm")
+    
     val compositeId: String = OrgAndId(orgid, username).toString
-    exchAuth(TUser(compositeId), Access.READ) { _ =>
-      complete({
-        // if we get here, the user/pw has been confirmed
-        (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("confirmation.successful")))
-      }) // end of complete
-    } // end of exchAuth
+
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TUser(compositeId), Access.READ) { _ =>
+        complete({
+          // if we get here, the user/pw has been confirmed
+          (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("confirmation.successful")))
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // =========== POST /orgs/{orgid}/users/{username}/changepw ===============================
@@ -565,29 +604,33 @@ trait UsersRoutes extends JacksonSupport with AuthenticationSupport {
   )
   def userChangePwRoute: Route = (path("orgs" / Segment / "users" / Segment / "changepw") & post & entity(as[ChangePwRequest])) { (orgid, username, reqBody) =>
     logger.debug(s"Doing POST /orgs/$orgid/users/$username")
+    
     val compositeId: String = OrgAndId(orgid, username).toString
-    exchAuth(TUser(compositeId), Access.WRITE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          val hashedPw: String = Password.hash(reqBody.newPassword)
-          val action = reqBody.getDbUpdate(compositeId, orgid, hashedPw)
-          db.run(action.transactionally.asTry).map({
-            case Success(n) =>
-              logger.debug("POST /orgs/" + orgid + "/users/" + username + "/changepw result: " + n)
-              if (n.asInstanceOf[Int] > 0) {
-                AuthCache.putUser(compositeId, hashedPw, reqBody.newPassword)
-                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("password.updated.successfully")))
-              } else {
-                (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("user.not.found", compositeId)))
-              }
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.password.not.updated", compositeId, t.toString))
-            case Failure(t) =>
-              (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.password.not.updated", compositeId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TUser(compositeId), Access.WRITE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            val hashedPw: String = Password.hash(reqBody.newPassword)
+            val action = reqBody.getDbUpdate(compositeId, orgid, hashedPw)
+            db.run(action.transactionally.asTry).map({
+              case Success(n) =>
+                logger.debug("POST /orgs/" + orgid + "/users/" + username + "/changepw result: " + n)
+                if (n.asInstanceOf[Int] > 0) {
+                  AuthCache.putUser(compositeId, hashedPw, reqBody.newPassword)
+                  (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("password.updated.successfully")))
+                } else {
+                  (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("user.not.found", compositeId)))
+                }
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("user.password.not.updated", compositeId, t.toString))
+              case Failure(t) =>
+                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("user.password.not.updated", compositeId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
 }

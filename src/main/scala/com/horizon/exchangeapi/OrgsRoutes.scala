@@ -31,6 +31,7 @@ import com.horizon.exchangeapi.tables.ExchangePostgresProfile.api._
 import scala.collection.immutable._
 import scala.collection.mutable.ListBuffer
 import scala.util._
+import akka.http.scaladsl.model.headers.Language
 
 /*someday: when we start using actors:
 import akka.actor.{ ActorRef, ActorSystem }
@@ -51,7 +52,7 @@ final case class GetOrgAttributeResponse(attribute: String, value: String)
 final case class PostPutOrgRequest(orgType: Option[String], label: String, description: String, tags: Option[Map[String, String]], limits: Option[OrgLimits], heartbeatIntervals: Option[NodeHeartbeatIntervals]) {
   require(label!=null && description!=null)
   protected implicit val jsonFormats: Formats = DefaultFormats
-  def getAnyProblem(orgMaxNodes: Int): Option[String] = {
+  def getAnyProblem(orgMaxNodes: Int)(implicit acceptLang: Language): Option[String] = {
     val exchangeMaxNodes: Int = ExchConfig.getInt("api.limits.maxNodes")
     if (orgMaxNodes > exchangeMaxNodes) Some.apply(ExchMsg.translate("org.limits.cannot.be.over.exchange.limits", orgMaxNodes, exchangeMaxNodes))
     else None
@@ -63,7 +64,7 @@ final case class PostPutOrgRequest(orgType: Option[String], label: String, descr
 final case class PatchOrgRequest(orgType: Option[String], label: Option[String], description: Option[String], tags: Option[Map[String, Option[String]]], limits: Option[OrgLimits], heartbeatIntervals: Option[NodeHeartbeatIntervals]) {
   protected implicit val jsonFormats: Formats = DefaultFormats
 
-  def getAnyProblem(orgMaxNodes: Int): Option[String] = {
+  def getAnyProblem(orgMaxNodes: Int)(implicit acceptLang: Language): Option[String] = {
     val exchangeMaxNodes: Int = ExchConfig.getInt("api.limits.maxNodes")
     if (orgMaxNodes > exchangeMaxNodes) Some.apply(ExchMsg.translate("org.limits.cannot.be.over.exchange.limits", orgMaxNodes, exchangeMaxNodes))
     else None
@@ -229,30 +230,33 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
     logger.debug(s"Doing GET /orgs with orgType:$orgType, label:$label")
     // If filter is orgType=IBM then it is a different access required than reading all orgs
     val access: exchangeapi.Access.Value = if (orgType.getOrElse("").contains("IBM")) Access.READ_IBM_ORGS else Access.READ_OTHER_ORGS
-    exchAuth(TOrg("*"), access) { ident =>
-      validate(orgType.isEmpty || orgType.get == "IBM", ExchMsg.translate("org.get.orgtype")) {
-        complete({ // this is an anonymous function that returns Future[(StatusCode, GetOrgsResponse)]
-          logger.debug(s"GET /orgs identity: ${ident.creds.id}") // can't display the whole ident object, because that contains the pw/token
-          var q = OrgsTQ.rows.subquery
-          // If multiple filters are specified they are ANDed together by adding the next filter to the previous filter by using q.filter
-          orgType match {
-            case Some(oType) => if (oType.contains("%")) q = q.filter(_.orgType like oType) else q = q.filter(_.orgType === oType);
-            case _ => ;
-          }
-          label match {
-            case Some(lab) => if (lab.contains("%")) q = q.filter(_.label like lab) else q = q.filter(_.label === lab);
-            case _ => ;
-          }
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TOrg("*"), access) { ident =>
+        validate(orgType.isEmpty || orgType.get == "IBM", ExchMsg.translate("org.get.orgtype")) {
+          complete({ // this is an anonymous function that returns Future[(StatusCode, GetOrgsResponse)]
+            logger.debug(s"GET /orgs identity: ${ident.creds.id}") // can't display the whole ident object, because that contains the pw/token
+            var q = OrgsTQ.rows.subquery
+            // If multiple filters are specified they are ANDed together by adding the next filter to the previous filter by using q.filter
+            orgType match {
+              case Some(oType) => if (oType.contains("%")) q = q.filter(_.orgType like oType) else q = q.filter(_.orgType === oType);
+              case _ => ;
+            }
+            label match {
+              case Some(lab) => if (lab.contains("%")) q = q.filter(_.label like lab) else q = q.filter(_.label === lab);
+              case _ => ;
+            }
 
-          db.run(q.result).map({ list =>
-            logger.debug("GET /orgs result size: " + list.size)
-            val orgs: Map[String, Org] = list.map(a => a.orgId -> a.toOrg).toMap
-            val code: StatusCode with Serializable = if (orgs.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-            (code, GetOrgsResponse(orgs, 0))
-          })
-        }) // end of complete
-      } // end of validate
-    } // end of exchAuth
+            db.run(q.result).map({ list =>
+              logger.debug("GET /orgs result size: " + list.size)
+              val orgs: Map[String, Org] = list.map(a => a.orgId -> a.toOrg).toMap
+              val code: StatusCode with Serializable = if (orgs.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+              (code, GetOrgsResponse(orgs, 0))
+            })
+          }) // end of complete
+        } // end of validate
+      } // end of exchAuth
+    }
   }
 
   // ====== GET /orgs/{orgid} ================================
@@ -301,31 +305,35 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied"),
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def orgGetRoute: Route = (path("orgs" / Segment) & get & parameter(Symbol("attribute").?)) { (orgId, attribute) =>
-    exchAuth(TOrg(orgId), Access.READ) { ident =>
-      logger.debug(s"GET /orgs/$orgId ident: ${ident.getIdentity}")
-      complete({
-        attribute match {
-          case Some(attr) => // Only returning 1 attr of the org
-            val q: horizon.exchangeapi.tables.ExchangePostgresProfile.api.Query[_, _, Seq] = OrgsTQ.getAttribute(orgId, attr) // get the proper db query for this attribute
-            if (q == null) (StatusCodes.BadRequest, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("org.attr.not.part.of.org", attr)))
-            else db.run(q.result).map({ list =>
-              logger.debug(s"GET /orgs/$orgId attribute result: ${list.toString}")
-              val code: StatusCode with Serializable = if (list.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-              // Note: scala is unhappy when db.run returns 2 different possible types, so we can't return ApiResponse in the case of not found
-              if (list.nonEmpty) (code, GetOrgAttributeResponse(attr, OrgsTQ.renderAttribute(list)))
-              else (StatusCodes.NotFound, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId)))
-            })
 
-          case None => // Return the whole org resource
-            db.run(OrgsTQ.getOrgid(orgId).result).map({ list =>
-              logger.debug(s"GET /orgs/$orgId result size: ${list.size}")
-              val orgs: Map[String, Org] = list.map(a => a.orgId -> a.toOrg).toMap
-              val code: StatusCode with Serializable = if (orgs.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
-              (code, GetOrgsResponse(orgs, 0))
-            })
-        } // attribute match
-      }) // end of complete
-    }   // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TOrg(orgId), Access.READ) { ident =>
+        logger.debug(s"GET /orgs/$orgId ident: ${ident.getIdentity}")
+        complete({
+          attribute match {
+            case Some(attr) => // Only returning 1 attr of the org
+              val q: horizon.exchangeapi.tables.ExchangePostgresProfile.api.Query[_, _, Seq] = OrgsTQ.getAttribute(orgId, attr) // get the proper db query for this attribute
+              if (q == null) (StatusCodes.BadRequest, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("org.attr.not.part.of.org", attr)))
+              else db.run(q.result).map({ list =>
+                logger.debug(s"GET /orgs/$orgId attribute result: ${list.toString}")
+                val code: StatusCode with Serializable = if (list.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+                // Note: scala is unhappy when db.run returns 2 different possible types, so we can't return ApiResponse in the case of not found
+                if (list.nonEmpty) (code, GetOrgAttributeResponse(attr, OrgsTQ.renderAttribute(list)))
+                else (StatusCodes.NotFound, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId)))
+              })
+
+            case None => // Return the whole org resource
+              db.run(OrgsTQ.getOrgid(orgId).result).map({ list =>
+                logger.debug(s"GET /orgs/$orgId result size: ${list.size}")
+                val orgs: Map[String, Org] = list.map(a => a.orgId -> a.toOrg).toMap
+                val code: StatusCode with Serializable = if (orgs.nonEmpty) StatusCodes.OK else StatusCodes.NotFound
+                (code, GetOrgsResponse(orgs, 0))
+              })
+          } // attribute match
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
   // ====== POST /orgs/{orgid} ================================
@@ -398,30 +406,33 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
   )
   def orgPostRoute: Route = (path("orgs" / Segment) & post & entity(as[PostPutOrgRequest])) { (orgId, reqBody) =>
     logger.debug(s"Doing POST /orgs/$orgId")
-    exchAuth(TOrg(""), Access.CREATE) { _ =>
-      validateWithMsg(reqBody.getAnyProblem(reqBody.limits.getOrElse(OrgLimits(0)).maxNodes)) {
-        complete({
-          db.run(reqBody.toOrgRow(orgId).insert.asTry.flatMap({
-            case Success(n) =>
-              // Add the resource to the resourcechanges table
-              logger.debug(s"POST /orgs/$orgId result: $n")
-              ResourceChange(0L, orgId, orgId, ResChangeCategory.ORG, false, ResChangeResource.ORG, ResChangeOperation.CREATED).insert.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(n) =>
-              logger.debug(s"POST /orgs/$orgId put in changes table: $n")
-              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("org.created", orgId)))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("org.not.created", orgId, t.getMessage)))
-              else if (ExchangePosgtresErrorHandling.isDuplicateKeyError(t)) (HttpCode.ALREADY_EXISTS2, ApiResponse(ApiRespType.ALREADY_EXISTS, ExchMsg.translate("org.already.exists", orgId, t.getMessage)))
-              else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("org.not.created", orgId, t.toString))
-            case Failure(t) =>
-              if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("org.not.created", orgId, t.getMessage)))
-              else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("org.not.created", orgId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TOrg(""), Access.CREATE) { _ =>
+        validateWithMsg(reqBody.getAnyProblem(reqBody.limits.getOrElse(OrgLimits(0)).maxNodes)) {
+          complete({
+            db.run(reqBody.toOrgRow(orgId).insert.asTry.flatMap({
+              case Success(n) =>
+                // Add the resource to the resourcechanges table
+                logger.debug(s"POST /orgs/$orgId result: $n")
+                ResourceChange(0L, orgId, orgId, ResChangeCategory.ORG, false, ResChangeResource.ORG, ResChangeOperation.CREATED).insert.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(n) =>
+                logger.debug(s"POST /orgs/$orgId put in changes table: $n")
+                (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("org.created", orgId)))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                if (ExchangePosgtresErrorHandling.isAccessDeniedError(t)) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("org.not.created", orgId, t.getMessage)))
+                else if (ExchangePosgtresErrorHandling.isDuplicateKeyError(t)) (HttpCode.ALREADY_EXISTS2, ApiResponse(ApiRespType.ALREADY_EXISTS, ExchMsg.translate("org.already.exists", orgId, t.getMessage)))
+                else ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("org.not.created", orgId, t.toString))
+              case Failure(t) =>
+                if (t.getMessage.startsWith("Access Denied:")) (HttpCode.ACCESS_DENIED, ApiResponse(ApiRespType.ACCESS_DENIED, ExchMsg.translate("org.not.created", orgId, t.getMessage)))
+                else (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("org.not.created", orgId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // ====== PUT /orgs/{orgid} ================================
@@ -465,34 +476,38 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def orgPutRoute: Route = (path("orgs" / Segment) & put & entity(as[PostPutOrgRequest])) { (orgId, reqBody) =>
     logger.debug(s"Doing PUT /orgs/$orgId with orgId:$orgId")
+    
     val access: exchangeapi.Access.Value = if (reqBody.orgType.getOrElse("") == "IBM") Access.SET_IBM_ORG_TYPE else Access.WRITE
-    exchAuth(TOrg(orgId), access) { _ =>
-      validateWithMsg(reqBody.getAnyProblem(reqBody.limits.getOrElse(OrgLimits(0)).maxNodes)) {
-        complete({
-          db.run(reqBody.toOrgRow(orgId).update.asTry.flatMap({
-            case Success(n) =>
-              // Add the resource to the resourcechanges table
-              logger.debug(s"PUT /orgs/$orgId result: $n")
-              if (n.asInstanceOf[Int] > 0) { // there were no db errors, but determine if it actually found it or not
-                ResourceChange(0L, orgId, orgId, ResChangeCategory.ORG, false, ResChangeResource.ORG, ResChangeOperation.CREATEDMODIFIED).insert.asTry
-              } else {
-                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId))).asTry
-              }
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(n) =>
-              logger.debug(s"PUT /orgs/$orgId updated in changes table: $n")
-              (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("org.updated")))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("org.not.updated", orgId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("org.not.updated", orgId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TOrg(orgId), access) { _ =>
+        validateWithMsg(reqBody.getAnyProblem(reqBody.limits.getOrElse(OrgLimits(0)).maxNodes)) {
+          complete({
+            db.run(reqBody.toOrgRow(orgId).update.asTry.flatMap({
+              case Success(n) =>
+                // Add the resource to the resourcechanges table
+                logger.debug(s"PUT /orgs/$orgId result: $n")
+                if (n.asInstanceOf[Int] > 0) { // there were no db errors, but determine if it actually found it or not
+                  ResourceChange(0L, orgId, orgId, ResChangeCategory.ORG, false, ResChangeResource.ORG, ResChangeOperation.CREATEDMODIFIED).insert.asTry
+                } else {
+                  DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId))).asTry
+                }
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(n) =>
+                logger.debug(s"PUT /orgs/$orgId updated in changes table: $n")
+                (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("org.updated")))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("org.not.updated", orgId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("org.not.updated", orgId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // ====== PATCH /orgs/{orgid} ================================
@@ -537,36 +552,40 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def orgPatchRoute: Route = (path("orgs" / Segment) & patch & entity(as[PatchOrgRequest])) { (orgId, reqBody) =>
     logger.debug(s"Doing PATCH /orgs/$orgId with orgId:$orgId")
+    
     val access: exchangeapi.Access.Value = if (reqBody.orgType.getOrElse("") == "IBM") Access.SET_IBM_ORG_TYPE else Access.WRITE
-    exchAuth(TOrg(orgId), access) { _ =>
-      validateWithMsg(reqBody.getAnyProblem(reqBody.limits.getOrElse(OrgLimits(0)).maxNodes)) {
-        complete({
-          val (action, attrName) = reqBody.getDbUpdate(orgId)
-          if (action == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("no.valid.org.attr.specified")))
-          else db.run(action.transactionally.asTry.flatMap({
-            case Success(n) =>
-              // Add the resource to the resourcechanges table
-              logger.debug(s"PATCH /orgs/$orgId result: $n")
-              if (n.asInstanceOf[Int] > 0) { // there were no db errors, but determine if it actually found it or not
-                ResourceChange(0L, orgId, orgId, ResChangeCategory.ORG, false, ResChangeResource.ORG, ResChangeOperation.MODIFIED).insert.asTry
-              } else {
-                DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId))).asTry
-              }
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(n) =>
-              logger.debug(s"PATCH /orgs/$orgId updated in changes table: $n")
-              (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("org.attr.updated", attrName, orgId)))
-            case Failure(t: DBProcessingError) =>
-              t.toComplete
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("org.not.updated", orgId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("org.not.updated", orgId, t.toString)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TOrg(orgId), access) { _ =>
+        validateWithMsg(reqBody.getAnyProblem(reqBody.limits.getOrElse(OrgLimits(0)).maxNodes)) {
+          complete({
+            val (action, attrName) = reqBody.getDbUpdate(orgId)
+            if (action == null) (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("no.valid.org.attr.specified")))
+            else db.run(action.transactionally.asTry.flatMap({
+              case Success(n) =>
+                // Add the resource to the resourcechanges table
+                logger.debug(s"PATCH /orgs/$orgId result: $n")
+                if (n.asInstanceOf[Int] > 0) { // there were no db errors, but determine if it actually found it or not
+                  ResourceChange(0L, orgId, orgId, ResChangeCategory.ORG, false, ResChangeResource.ORG, ResChangeOperation.MODIFIED).insert.asTry
+                } else {
+                  DBIO.failed(new DBProcessingError(HttpCode.NOT_FOUND, ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId))).asTry
+                }
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(n) =>
+                logger.debug(s"PATCH /orgs/$orgId updated in changes table: $n")
+                (HttpCode.PUT_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("org.attr.updated", attrName, orgId)))
+              case Failure(t: DBProcessingError) =>
+                t.toComplete
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("org.not.updated", orgId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("org.not.updated", orgId, t.toString)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
 
@@ -583,49 +602,59 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def orgDeleteRoute: Route = (path("orgs" / Segment) & delete) { (orgId) =>
     logger.debug(s"Doing DELETE /orgs/$orgId")
-    exchAuth(TOrg(orgId), Access.DELETE_ORG) { _ =>
-      validate(orgId != "root", ExchMsg.translate("cannot.delete.root.org")) {
-        complete({
-          // DB actions to get the user/agbot/node id's in this org
-          var getResourceIds = DBIO.sequence(Seq(UsersTQ.getAllUsersUsername(orgId).result, AgbotsTQ.getAllAgbotsId(orgId).result, NodesTQ.getAllNodesId(orgId).result))
-          var resourceIds: Seq[Seq[String]] = null
-          var orgFound = true
-          // remove does *not* throw an exception if the key does not exist
-          db.run(getResourceIds.asTry.flatMap({
-            case Success(v) =>
-              logger.debug(s"DELETE /orgs/$orgId remove from cache: users: ${v(0).size}, agbots: ${v(1).size}, nodes: ${v(2).size}")
-              resourceIds = v // save for a subsequent step - this is a vector of 3 vectors
-              OrgsTQ.getOrgid(orgId).delete.transactionally.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          }).flatMap({
-            case Success(v) =>
-              logger.debug(s"DELETE /orgs/$orgId result: $v")
-              if (v > 0) { // there were no db errors, but determine if it actually found it or not
-                ResourceChange(0L, orgId, orgId, ResChangeCategory.ORG, false, ResChangeResource.ORG, ResChangeOperation.DELETED).insert.asTry
-              } else {
-                orgFound = false
-                DBIO.successful("no update in resourcechanges table").asTry // just give a success to get us to the next step, but notify that it wasn't added to the resourcechanges table
-              }
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(v) =>
-              logger.debug(s"DELETE /orgs/$orgId updated in changes table: $v")
-              if (orgFound && resourceIds!=null) {
-                // Loop thru user/agbot/node id's and remove them from the cache
-                for (id <- resourceIds(0)) { /*println(s"removing $id from cache");*/ AuthCache.removeUser(id) } // users
-                for (id <- resourceIds(1)) { /*println(s"removing $id from cache");*/ AuthCache.removeAgbotAndOwner(id) } // agbots
-                for (id <- resourceIds(2)) { /*println(s"removing $id from cache");*/ AuthCache.removeNodeAndOwner(id) } // nodes
-                IbmCloudAuth.clearCache() // no alternative but sledgehammer approach because the IAM cache is keyed by api key
-                (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("org.deleted")))
-              } else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId)))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("org.not.deleted", orgId, t.toString))
-            case Failure(t) =>
-              (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("org.not.deleted", orgId, t.toString)))
-          })
-        }) // end of complete
-      }
-    } // end of exchAuth
+
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TOrg(orgId), Access.DELETE_ORG) { _ =>
+        validate(orgId != "root", ExchMsg.translate("cannot.delete.root.org")) {
+          complete({
+            // DB actions to get the user/agbot/node id's in this org
+            var getResourceIds = DBIO.sequence(Seq(UsersTQ.getAllUsersUsername(orgId).result, AgbotsTQ.getAllAgbotsId(orgId).result, NodesTQ.getAllNodesId(orgId).result))
+            var resourceIds: Seq[Seq[String]] = null
+            var orgFound = true
+            // remove does *not* throw an exception if the key does not exist
+            db.run(getResourceIds.asTry.flatMap({
+              case Success(v) =>
+                logger.debug(s"DELETE /orgs/$orgId remove from cache: users: ${v(0).size}, agbots: ${v(1).size}, nodes: ${v(2).size}")
+                resourceIds = v // save for a subsequent step - this is a vector of 3 vectors
+                OrgsTQ.getOrgid(orgId).delete.transactionally.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            }).flatMap({
+              case Success(v) =>
+                logger.debug(s"DELETE /orgs/$orgId result: $v")
+                if (v > 0) { // there were no db errors, but determine if it actually found it or not
+                  ResourceChange(0L, orgId, orgId, ResChangeCategory.ORG, false, ResChangeResource.ORG, ResChangeOperation.DELETED).insert.asTry
+                } else {
+                  orgFound = false
+                  DBIO.successful("no update in resourcechanges table").asTry // just give a success to get us to the next step, but notify that it wasn't added to the resourcechanges table
+                }
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(v) =>
+                logger.debug(s"DELETE /orgs/$orgId updated in changes table: $v")
+                if (orgFound && resourceIds != null) {
+                  // Loop thru user/agbot/node id's and remove them from the cache
+                  for (id <- resourceIds(0)) {
+                    /*println(s"removing $id from cache");*/ AuthCache.removeUser(id)
+                  } // users
+                  for (id <- resourceIds(1)) {
+                    /*println(s"removing $id from cache");*/ AuthCache.removeAgbotAndOwner(id)
+                  } // agbots
+                  for (id <- resourceIds(2)) {
+                    /*println(s"removing $id from cache");*/ AuthCache.removeNodeAndOwner(id)
+                  } // nodes
+                  IbmCloudAuth.clearCache() // no alternative but sledgehammer approach because the IAM cache is keyed by api key
+                  (HttpCode.DELETED, ApiResponse(ApiRespType.OK, ExchMsg.translate("org.deleted")))
+                } else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("org.not.found", orgId)))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("org.not.deleted", orgId, t.toString))
+              case Failure(t) =>
+                (HttpCode.INTERNAL_ERROR, ApiResponse(ApiRespType.INTERNAL_ERROR, ExchMsg.translate("org.not.deleted", orgId, t.toString)))
+            })
+          }) // end of complete
+        }
+      } // end of exchAuth
+    }
   }
 
   // ======== POST /org/{orgid}/search/nodes/error ========================
@@ -643,6 +672,7 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def orgPostNodesErrorRoute: Route = (path("orgs" / Segment / "search" / "nodes" / "error") & post) { (orgid) =>
     logger.debug(s"Doing POST /orgs/$orgid/search/nodes/error")
+    
     exchAuth(TNode(OrgAndId(orgid,"#").toString),Access.READ) { ident =>
       complete({
         var queryParam = NodesTQ.rows.filter(_.orgid === orgid)
@@ -679,6 +709,7 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "404", description = "not found")))
   def nodeGetAllErrorsRoute: Route = (path("orgs" / Segment / "search"  / "nodes" / "error" / "all") & get) { orgid =>
     logger.debug(s"Doing GET /orgs/$orgid/search/nodes/error/all")
+    
     exchAuth(TNode(OrgAndId(orgid,"#").toString),Access.READ) { ident =>
       complete({
         var queryParam = NodesTQ.rows.filter(_.orgid === orgid)
@@ -779,6 +810,7 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
   )
   def orgPostNodesServiceRoute: Route = (path("orgs" / Segment / "search" / "nodes" / "service") & post & entity(as[PostServiceSearchRequest])) { (orgid, reqBody) =>
     logger.debug(s"Doing POST /orgs/$orgid/search/nodes/service")
+    
     exchAuth(TNode(OrgAndId(orgid,"#").toString),Access.READ) { ident =>
       validateWithMsg(reqBody.getAnyProblem) {
         complete({
@@ -886,6 +918,7 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
   )
   def orgPostNodesHealthRoute: Route = (path("orgs" / Segment / "search" / "nodehealth") & post & entity(as[PostNodeHealthRequest])) { (orgid, reqBody) =>
     logger.debug(s"Doing POST /orgs/$orgid/search/nodehealth")
+    
     exchAuth(TNode(OrgAndId(orgid,"*").toString),Access.READ) { _ =>
       validateWithMsg(reqBody.getAnyProblem) {
         complete({
@@ -1000,86 +1033,90 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
   )
   def orgChangesRoute: Route = (path("orgs" / Segment / "changes") & post & entity(as[ResourceChangesRequest])) { (orgId, reqBody) =>
     logger.debug(s"Doing POST /orgs/$orgId/changes")
-    exchAuth(TOrg(orgId), Access.READ) { ident =>
-      validateWithMsg(reqBody.getAnyProblem) {
-        complete({
-          // make sure callers obey maxRecords cap set in config, defaults is 10,000
-          val maxRecordsCap: Int = ExchConfig.getInt("api.resourceChanges.maxRecordsCap")
-          val maxRecords: Int = if (reqBody.maxRecords > maxRecordsCap) maxRecordsCap else reqBody.maxRecords
-          // Create a query to get the last changeid currently in the table
-          val qMaxChangeId = ResourceChangesTQ.rows.sortBy(_.changeId.desc).take(1).map(_.changeId)
-          val orgList : List[String] = if (reqBody.orgList.isDefined && reqBody.orgList.getOrElse(List()).contains(orgId)) reqBody.orgList.getOrElse(List("")) else reqBody.orgList.getOrElse(List("")) ++ List(orgId)
-          val orgSet : Set[String] = orgList.toSet
-          var maxChangeId = 0L
-          val reqBodyTime : java.sql.Timestamp = java.sql.Timestamp.from(ZonedDateTime.parse(reqBody.lastUpdated.getOrElse(ApiTime.beginningUTC)).toInstant)
-          // Create query to get the rows relevant to this client. We only support either changeId or lastUpdated being specified, but not both
-          var qFilter = if (reqBody.lastUpdated.getOrElse("") != "" && reqBody.changeId <= 0) ResourceChangesTQ.rows.filter(_.lastUpdated >= reqBodyTime) else ResourceChangesTQ.rows.filter(_.changeId >= reqBody.changeId)
 
-          ident match {
-            case _: INode =>
-              // if its a node calling then it doesn't want information about any other nodes
-              /* Note: these filters in the commented out line were replaced with the line below it because it was found that postgresql used significantly less CPU processing filters that don't contain
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TOrg(orgId), Access.READ) { ident =>
+        validateWithMsg(reqBody.getAnyProblem) {
+          complete({
+            // make sure callers obey maxRecords cap set in config, defaults is 10,000
+            val maxRecordsCap: Int = ExchConfig.getInt("api.resourceChanges.maxRecordsCap")
+            val maxRecords: Int = if (reqBody.maxRecords > maxRecordsCap) maxRecordsCap else reqBody.maxRecords
+            // Create a query to get the last changeid currently in the table
+            val qMaxChangeId = ResourceChangesTQ.rows.sortBy(_.changeId.desc).take(1).map(_.changeId)
+            val orgList: List[String] = if (reqBody.orgList.isDefined && reqBody.orgList.getOrElse(List()).contains(orgId)) reqBody.orgList.getOrElse(List("")) else reqBody.orgList.getOrElse(List("")) ++ List(orgId)
+            val orgSet: Set[String] = orgList.toSet
+            var maxChangeId = 0L
+            val reqBodyTime: java.sql.Timestamp = java.sql.Timestamp.from(ZonedDateTime.parse(reqBody.lastUpdated.getOrElse(ApiTime.beginningUTC)).toInstant)
+            // Create query to get the rows relevant to this client. We only support either changeId or lastUpdated being specified, but not both
+            var qFilter = if (reqBody.lastUpdated.getOrElse("") != "" && reqBody.changeId <= 0) ResourceChangesTQ.rows.filter(_.lastUpdated >= reqBodyTime) else ResourceChangesTQ.rows.filter(_.changeId >= reqBody.changeId)
+
+            ident match {
+              case _: INode =>
+                // if its a node calling then it doesn't want information about any other nodes
+                /* Note: these filters in the commented out line were replaced with the line below it because it was found that postgresql used significantly less CPU processing filters that don't contain
                     inequality statements. In postgresql 9 the difference was dramatic. In postgreql 12 the difference was less but still signficant. Logically, the only difference between these 2 lines
                     is that the latter will not get changes in patterns or deployment policies. But the node doesn't need these, because the agbots drive the response to those.
                 qFilter = qFilter.filter(u => (u.orgId === orgId) || (u.orgId =!= orgId && u.public === "true")).filter(u => (u.category === "node" && u.id === ident.getIdentity) || u.category =!= "node") */
-                qFilter = qFilter.filter(u => (u.orgId === orgId) || u.public === "true") .filter(u => (u.category === "node" && u.id === ident.getIdentity) || (u.category === "service" || u.category === "org"))
-            case _: IAgbot =>
-              val wildcard: Boolean = orgSet.contains("*") || orgSet.contains("")
-              if (ident.isMultiTenantAgbot && !wildcard) { // its an IBM Agbot with no wildcard sent in, get all changes from orgs the agbot covers
-                qFilter = qFilter.filter(u => (u.orgId inSet orgSet) || ((u.resource === "org") && (u.operation === ResChangeOperation.CREATED.toString))).filterNot(_.resource === "nodemsgs").filterNot(_.resource === "nodestatus").filterNot(u => u.resource === "nodeagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString).filterNot(u => u.resource === "agbotagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString)
-              } else if ( ident.isMultiTenantAgbot && wildcard) {
-                // if the IBM agbot sends in the wildcard case then we don't want to filter on orgId at all
-                qFilter = qFilter.filterNot(_.resource === "nodemsgs").filterNot(_.resource === "nodestatus").filterNot(u => u.resource === "nodeagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString).filterNot(u => u.resource === "agbotagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString)
-              } else {
-                qFilter = qFilter.filter(u => (u.orgId === orgId) || (u.orgId =!= orgId && u.public === "true")).filterNot(_.resource === "nodemsgs").filterNot(_.resource === "nodestatus").filterNot(u => u.resource === "nodeagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString).filterNot(u => u.resource === "agbotagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString) // if its not an IBM agbot only allow access to the agbot's own org and public changes from other orgs
-              }
-            case _ => qFilter = qFilter.filter(u => (u.orgId === orgId) || (u.orgId =!= orgId && u.public === "true"))
-          }
-          // sort by changeId and take only maxRecords from the query
-          qFilter = qFilter.sortBy(_.changeId).take(maxRecords)
+                qFilter = qFilter.filter(u => (u.orgId === orgId) || u.public === "true").filter(u => (u.category === "node" && u.id === ident.getIdentity) || (u.category === "service" || u.category === "org"))
+              case _: IAgbot =>
+                val wildcard: Boolean = orgSet.contains("*") || orgSet.contains("")
+                if (ident.isMultiTenantAgbot && !wildcard) { // its an IBM Agbot with no wildcard sent in, get all changes from orgs the agbot covers
+                  qFilter = qFilter.filter(u => (u.orgId inSet orgSet) || ((u.resource === "org") && (u.operation === ResChangeOperation.CREATED.toString))).filterNot(_.resource === "nodemsgs").filterNot(_.resource === "nodestatus").filterNot(u => u.resource === "nodeagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString).filterNot(u => u.resource === "agbotagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString)
+                } else if (ident.isMultiTenantAgbot && wildcard) {
+                  // if the IBM agbot sends in the wildcard case then we don't want to filter on orgId at all
+                  qFilter = qFilter.filterNot(_.resource === "nodemsgs").filterNot(_.resource === "nodestatus").filterNot(u => u.resource === "nodeagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString).filterNot(u => u.resource === "agbotagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString)
+                } else {
+                  qFilter = qFilter.filter(u => (u.orgId === orgId) || (u.orgId =!= orgId && u.public === "true")).filterNot(_.resource === "nodemsgs").filterNot(_.resource === "nodestatus").filterNot(u => u.resource === "nodeagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString).filterNot(u => u.resource === "agbotagreements" && u.operation === ResChangeOperation.CREATEDMODIFIED.toString) // if its not an IBM agbot only allow access to the agbot's own org and public changes from other orgs
+                }
+              case _ => qFilter = qFilter.filter(u => (u.orgId === orgId) || (u.orgId =!= orgId && u.public === "true"))
+            }
+            // sort by changeId and take only maxRecords from the query
+            qFilter = qFilter.sortBy(_.changeId).take(maxRecords)
 
-          logger.debug(s"POST /orgs/$orgId/changes db query: ${qFilter.result.statements}")
-          var qResp : scala.Seq[ResourceChangeRow] = null
+            logger.debug(s"POST /orgs/$orgId/changes db query: ${qFilter.result.statements}")
+            var qResp: scala.Seq[ResourceChangeRow] = null
 
-          db.run(qMaxChangeId.result.asTry.flatMap({
-            case Success(qMaxChangeIdResp) =>
-              maxChangeId = if (qMaxChangeIdResp.nonEmpty) qMaxChangeIdResp.head else 0
-              qFilter.result.asTry
-            case Failure(t) => DBIO.failed(t).asTry
-          }).flatMap({
-            case Success(qResult) =>
-              //logger.debug("POST /orgs/" + orgId + "/changes changes : " + qOrgResult.toString())
-              logger.debug("POST /orgs/" + orgId + "/changes number of changed rows retrieved: " + qResult.size)
-              qResp = qResult
-              val id: String = orgId + "/" + ident.getIdentity
-              ident match {
-                case _: INode =>
-                  NodesTQ.getLastHeartbeat(id).update(Some(ApiTime.nowUTC)).asTry
-                case _: IAgbot =>
-                  AgbotsTQ.getLastHeartbeat(id).update(ApiTime.nowUTC).asTry
-                case _ =>
-                  // Caller isn't a node or agbot so no need to heartbeat, just send a success in this step
-                  // v in the next step must be > 0 so any n > 0 works
-                  DBIO.successful(1).asTry
-              }
-            case Failure(t) => DBIO.failed(t).asTry
-          })).map({
-            case Success(n) =>
-              logger.debug(s"POST /orgs/$orgId/changes node/agbot heartbeat result: $n")
-              if (n > 0) {
-                val hitMaxRecords: Boolean = (qResp.size >= maxRecords) // if they are equal then we hit maxRecords
-                if(qResp.nonEmpty) (HttpCode.POST_OK, buildResourceChangesResponse(qResp, hitMaxRecords, reqBody.changeId, maxChangeId))
-                else (HttpCode.POST_OK, ResourceChangesRespObject(List[ChangeEntry](), maxChangeId, hitMaxRecords = false, ExchangeApi.adminVersion()))
-              }
-            else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.or.agbot.not.found", ident.getIdentity)))
-            case Failure(t: org.postgresql.util.PSQLException) =>
-              ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("invalid.input.message", t.getMessage))
-            case Failure(t) =>
-              (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.message", t.getMessage)))
-          })
-        }) // end of complete
-      } // end of validateWithMsg
-    } // end of exchAuth
+            db.run(qMaxChangeId.result.asTry.flatMap({
+              case Success(qMaxChangeIdResp) =>
+                maxChangeId = if (qMaxChangeIdResp.nonEmpty) qMaxChangeIdResp.head else 0
+                qFilter.result.asTry
+              case Failure(t) => DBIO.failed(t).asTry
+            }).flatMap({
+              case Success(qResult) =>
+                //logger.debug("POST /orgs/" + orgId + "/changes changes : " + qOrgResult.toString())
+                logger.debug("POST /orgs/" + orgId + "/changes number of changed rows retrieved: " + qResult.size)
+                qResp = qResult
+                val id: String = orgId + "/" + ident.getIdentity
+                ident match {
+                  case _: INode =>
+                    NodesTQ.getLastHeartbeat(id).update(Some(ApiTime.nowUTC)).asTry
+                  case _: IAgbot =>
+                    AgbotsTQ.getLastHeartbeat(id).update(ApiTime.nowUTC).asTry
+                  case _ =>
+                    // Caller isn't a node or agbot so no need to heartbeat, just send a success in this step
+                    // v in the next step must be > 0 so any n > 0 works
+                    DBIO.successful(1).asTry
+                }
+              case Failure(t) => DBIO.failed(t).asTry
+            })).map({
+              case Success(n) =>
+                logger.debug(s"POST /orgs/$orgId/changes node/agbot heartbeat result: $n")
+                if (n > 0) {
+                  val hitMaxRecords: Boolean = (qResp.size >= maxRecords) // if they are equal then we hit maxRecords
+                  if (qResp.nonEmpty) (HttpCode.POST_OK, buildResourceChangesResponse(qResp, hitMaxRecords, reqBody.changeId, maxChangeId))
+                  else (HttpCode.POST_OK, ResourceChangesRespObject(List[ChangeEntry](), maxChangeId, hitMaxRecords = false, ExchangeApi.adminVersion()))
+                }
+                else (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("node.or.agbot.not.found", ident.getIdentity)))
+              case Failure(t: org.postgresql.util.PSQLException) =>
+                ExchangePosgtresErrorHandling.ioProblemError(t, ExchMsg.translate("invalid.input.message", t.getMessage))
+              case Failure(t) =>
+                (HttpCode.BAD_INPUT, ApiResponse(ApiRespType.BAD_INPUT, ExchMsg.translate("invalid.input.message", t.getMessage)))
+            })
+          }) // end of complete
+        } // end of validateWithMsg
+      } // end of exchAuth
+    }
   }
 
   // ====== GET /changes/maxchangeid ================================
@@ -1094,6 +1131,7 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied")))
   def orgsGetMaxChangeIdRoute: Route = (path("changes" / "maxchangeid") & get) {
     logger.debug("Doing GET /changes/maxchangeid")
+    
     exchAuth(TAction(), Access.MAXCHANGEID) { _ =>
       complete({
         val q = ResourceChangesTQ.rows.sortBy(_.changeId.desc).take(1).map(_.changeId)
@@ -1177,6 +1215,7 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
       new responses.ApiResponse(responseCode = "403", description = "access denied")))
   def myOrgsPostRoute: Route = (path("myorgs") & post & entity(as[List[IamAccountInfo]])) { reqBody =>
     logger.debug("Doing POST /myorgs")
+    
     // set hint here to some key that states that no org is ok
     // UI should omit org at the beginning of credentials still have them put the slash in there
     exchAuth(TOrg("#"), Access.READ_MY_ORG, hint = "exchangeNoOrgForMultLogin") { _ =>
@@ -1252,49 +1291,56 @@ trait OrgsRoutes extends JacksonSupport with AuthenticationSupport {
     )
   )
   def agbotAgreementConfirmRoute: Route = (path("orgs" / Segment / "agreements" / "confirm") & post & entity(as[PostAgreementsConfirmRequest])) { (orgid, reqBody) =>
-    exchAuth(TAgbot(OrgAndId(orgid,"#").toString), Access.READ) { ident =>
-      complete({
-        val creds = ident.creds
-        val owner = ident match { case IUser(creds2) => creds2.id; case _ => "" }
-        if (owner != "") {
-          // the user invoked this rest method, so look for an agbot owned by this user with this agr id
-          val agbotAgreementJoin = for {
-            (agbot, agr) <- AgbotsTQ.rows joinLeft AgbotAgreementsTQ.rows on (_.id === _.agbotId)
-            if agbot.owner === owner && agr.map(_.agrId) === reqBody.agreementId
-          } yield (agbot, agr)
-          db.run(agbotAgreementJoin.result).map({ list =>
-            logger.debug("POST /agreements/confirm of "+reqBody.agreementId+" result: "+list.toString)
-            // this list is tuples of (AgbotRow, Option(AgbotAgreementRow)) in which agbot.owner === owner && agr.agrId === req.agreementId
-            if (list.nonEmpty && list.head._2.isDefined && list.head._2.get.state != "") {
-              (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agreement.active")))
-            } else {
-              (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agreement.not.found.not.active")))
-            }
-          })
-        } else {
-          // an agbot invoked this rest method, so look for the agbot with this id and for the agbot with this agr id, and see if they are owned by the same user
-          val agbotAgreementJoin = for {
-            (agbot, agr) <- AgbotsTQ.rows joinLeft AgbotAgreementsTQ.rows on (_.id === _.agbotId)
-            if agbot.id === creds.id || agr.map(_.agrId) === reqBody.agreementId
-          } yield (agbot, agr)
-          db.run(agbotAgreementJoin.result).map({ list =>
-            logger.debug("POST /agreements/confirm of "+reqBody.agreementId+" result: "+list.toString)
-            if (list.nonEmpty) {
-              // this list is tuples of (AgbotRow, Option(AgbotAgreementRow)) in which agbot.id === creds.id || agr.agrId === req.agreementId
-              val agbot1 = list.find(r => r._1.id == creds.id).orNull
-              val agbot2 = list.find(r => r._2.isDefined && r._2.get.agrId == reqBody.agreementId).orNull
-              if (agbot1 != null && agbot2 != null && agbot1._1.owner == agbot2._1.owner && agbot2._2.get.state != "") {
+
+    selectPreferredLanguage(ExchConfig.defaultLang, ExchConfig.supportedLang: _*) { lang =>
+      implicit val acceptLang: Language = lang
+      exchAuth(TAgbot(OrgAndId(orgid, "#").toString), Access.READ) { ident =>
+        complete({
+          val creds = ident.creds
+          val owner = ident match {
+            case IUser(creds2) => creds2.id;
+            case _ => ""
+          }
+          if (owner != "") {
+            // the user invoked this rest method, so look for an agbot owned by this user with this agr id
+            val agbotAgreementJoin = for {
+              (agbot, agr) <- AgbotsTQ.rows joinLeft AgbotAgreementsTQ.rows on (_.id === _.agbotId)
+              if agbot.owner === owner && agr.map(_.agrId) === reqBody.agreementId
+            } yield (agbot, agr)
+            db.run(agbotAgreementJoin.result).map({ list =>
+              logger.debug("POST /agreements/confirm of " + reqBody.agreementId + " result: " + list.toString)
+              // this list is tuples of (AgbotRow, Option(AgbotAgreementRow)) in which agbot.owner === owner && agr.agrId === req.agreementId
+              if (list.nonEmpty && list.head._2.isDefined && list.head._2.get.state != "") {
                 (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agreement.active")))
               } else {
                 (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agreement.not.found.not.active")))
               }
-            } else {
-              (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agreement.not.found.not.active")))
-            }
-          })
-        }
-      }) // end of complete
-    } // end of exchAuth
+            })
+          } else {
+            // an agbot invoked this rest method, so look for the agbot with this id and for the agbot with this agr id, and see if they are owned by the same user
+            val agbotAgreementJoin = for {
+              (agbot, agr) <- AgbotsTQ.rows joinLeft AgbotAgreementsTQ.rows on (_.id === _.agbotId)
+              if agbot.id === creds.id || agr.map(_.agrId) === reqBody.agreementId
+            } yield (agbot, agr)
+            db.run(agbotAgreementJoin.result).map({ list =>
+              logger.debug("POST /agreements/confirm of " + reqBody.agreementId + " result: " + list.toString)
+              if (list.nonEmpty) {
+                // this list is tuples of (AgbotRow, Option(AgbotAgreementRow)) in which agbot.id === creds.id || agr.agrId === req.agreementId
+                val agbot1 = list.find(r => r._1.id == creds.id).orNull
+                val agbot2 = list.find(r => r._2.isDefined && r._2.get.agrId == reqBody.agreementId).orNull
+                if (agbot1 != null && agbot2 != null && agbot1._1.owner == agbot2._1.owner && agbot2._2.get.state != "") {
+                  (HttpCode.POST_OK, ApiResponse(ApiRespType.OK, ExchMsg.translate("agreement.active")))
+                } else {
+                  (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agreement.not.found.not.active")))
+                }
+              } else {
+                (HttpCode.NOT_FOUND, ApiResponse(ApiRespType.NOT_FOUND, ExchMsg.translate("agreement.not.found.not.active")))
+              }
+            })
+          }
+        }) // end of complete
+      } // end of exchAuth
+    }
   }
 
 }
